@@ -6,12 +6,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize, de::{self, Deserializer}};
+use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, env, time::Duration, sync::Arc, fs};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use dotenvy::dotenv;
+use chrono::Utc;
 
 #[derive(Clone, Debug)]
 enum AuthMode {
@@ -129,6 +130,7 @@ struct TradeSearchReq<'a> {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 struct TradeRecord {
     id: i64,
     account_id: i32,
@@ -205,6 +207,31 @@ struct PxClient {
     token: RwLock<Option<String>>,
 }
 
+// =============== Position Models =================
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionSearchOpenReq { account_id: i32 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionRecord {
+    id: i64,
+    account_id: i32,
+    contract_id: String,
+    creation_timestamp: String,
+    r#type: i32,        // direction flag from API
+    size: i32,          // net size
+    average_price: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionSearchOpenRes { positions: Vec<PositionRecord> }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseContractReq<'a> { account_id: i32, contract_id: &'a str }
+
 impl PxClient {
     fn new(api_base: String, auth: AuthMode) -> Self {
         let http = Client::builder().build().unwrap();
@@ -274,6 +301,35 @@ impl PxClient {
         let req = AccountSearchReq { only_active_accounts: only_active };
         self.authed_post("/api/Account/search", &req).await
     }
+
+    async fn search_open_positions(&self, account_id: i32) -> Result<PositionSearchOpenRes> {
+        let req = PositionSearchOpenReq { account_id };
+        self.authed_post("/api/Position/searchOpen", &req).await
+    }
+
+    async fn close_contract(&self, account_id: i32, contract_id: &str) -> Result<()> {
+        let req = CloseContractReq { account_id, contract_id };
+        // same authed_post, but ignore envelope payload
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let token = self.bearer().await?;
+            let url = format!("{}{}", self.api_base, "/api/Position/closeContract");
+            let resp = self.http.post(url).bearer_auth(&token).json(&req).send().await?;
+            if resp.status() == StatusCode::UNAUTHORIZED && attempts < 2 {
+                self.login().await?;
+                continue;
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("POST /api/Position/closeContract failed: {} — {}", status, txt));
+            }
+            break;
+        }
+        Ok(())
+    }
+
 }
 
 // =============== Copier Logic =================
@@ -297,6 +353,54 @@ impl Copier {
             seen: RwLock::new(HashSet::new()),
             src_pos: RwLock::new(HashMap::new()),
             dest_pos: RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn reconcile_on_startup(&self) {
+        use std::collections::HashSet;
+
+        // 1) Build set of contracts that are OPEN on the leader
+        let mut src_open: HashSet<String> = HashSet::new();
+        match self.src.search_open_positions(self.source_account_id).await {
+            Ok(res) => {
+                for p in res.positions {
+                    src_open.insert(p.contract_id.clone());
+                    // Seed source pos cache
+                    let mut sp = self.src_pos.write().await;
+                    sp.insert((self.source_account_id, p.contract_id.clone()), p.size);
+                }
+            }
+            Err(e) => warn!("startup reconcile: failed to load source positions: {}", e),
+        }
+
+        // 2) For each follower, close any contract not open on leader
+        for &dest in &self.dest_account_ids {
+            match self.dest.search_open_positions(dest).await {
+                Ok(res) => {
+                    for p in res.positions {
+                        // seed follower cache
+                        {
+                            let mut dp = self.dest_pos.write().await;
+                            dp.insert((dest, p.contract_id.clone()), p.size);
+                        }
+                        if !src_open.contains(&p.contract_id) {
+                            info!("Startup reconcile: closing {} on dest {} (leader flat)", p.contract_id, dest);
+                            if let Err(e) = self.dest.close_contract(dest, &p.contract_id).await {
+                                warn!("Failed to close {} on dest {} during startup reconcile: {}", p.contract_id, dest, e);
+                            } else {
+                                let mut dp = self.dest_pos.write().await;
+                                dp.remove(&(dest, p.contract_id.clone()));
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!("startup reconcile: failed to load dest {} positions: {}", dest, e),
+            }
+        }
+
+        // For contracts open on leader, ensure followers match leader size
+        for contract_id in src_open.iter() {
+            self.sync_dest_to_source_for_contract(contract_id).await;
         }
     }
 
@@ -368,9 +472,59 @@ impl Copier {
         }
     }
 
+    async fn sync_dest_to_source_for_contract(&self, contract_id: &str) {
+        // Leader's net
+        let src_key = (self.source_account_id, contract_id.to_string());
+        let src_net = { *self.src_pos.read().await.get(&src_key).unwrap_or(&0) };
+
+        for &dest in &self.dest_account_ids {
+            let dest_key = (dest, contract_id.to_string());
+            let dest_net = { *self.dest_pos.read().await.get(&dest_key).unwrap_or(&0) };
+            let diff = src_net - dest_net; // >0 => need to BUY on follower; <0 => SELL on follower
+            if diff == 0 { continue; }
+
+            let side = if diff > 0 { 0 } else { 1 }; // 0=buy, 1=sell
+            let size = diff.abs();
+            let tag = format!("TCX:SYNC:{}:{}:{}", contract_id, dest, diff);
+
+            let req = PlaceOrderReq {
+                account_id: dest,
+                contract_id,
+                r#type: 2,
+                side,
+                size,
+                limit_price: None,
+                stop_price: None,
+                trail_price: None,
+                custom_tag: Some(tag),
+                linked_order_id: None,
+            };
+
+            match self.dest.place_order(&req).await {
+                Ok(resp) => {
+                    info!(
+                    "Sync {}: adjusted dest {} by {} (leader net {}) via order {}",
+                    contract_id, dest, diff, src_net, resp.order_id
+                );
+                    // Update follower cache to reflect new net
+                    let mut dp = self.dest_pos.write().await;
+                    if src_net == 0 { dp.remove(&dest_key); } else { dp.insert(dest_key, src_net); }
+                }
+                Err(e) => warn!(
+                "Sync {}: failed to adjust dest {} by {}: {}",
+                contract_id, dest, diff, e
+            ),
+            }
+        }
+    }
+
     async fn run(&self) -> Result<()> {
         info!("TradeCopierX starting");
-        let mut since_rfc3339: Option<String> = None;
+        // A) Flatten stragglers first (don’t replay history)
+        self.reconcile_on_startup().await;
+
+        // B) Only consume trades from now onwards
+        let mut since_rfc3339: Option<String> = Some(Utc::now().to_rfc3339());
 
         loop {
             // 1) Poll source trades
@@ -418,6 +572,9 @@ impl Copier {
 
                         // If the leader is flat on this contract, ensure followers are flat too
                         self.flatten_dest_if_needed(&tr.contract_id).await;
+
+                        // Keep followers exactly matched to leader net for this contract
+                        self.sync_dest_to_source_for_contract(&tr.contract_id).await;
 
                         // advance watermark
                         since_rfc3339 = Some(tr.creation_timestamp.clone());
