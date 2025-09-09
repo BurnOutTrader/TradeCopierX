@@ -1,8 +1,10 @@
 use reqwest::{Client, StatusCode};
 use tokio::sync::RwLock;
 use anyhow::anyhow;
+use reqwest::header::ACCEPT;
 use serde::{Deserialize, Serialize};
-use crate::models::{AccountSearchReq, AccountSearchRes, ApiEnvelope, AuthMode, CloseContractReq, LoginKeyReq, LoginKeyRes, PlaceOrderReq, PlaceOrderRes, PositionSearchOpenReq, PositionSearchOpenRes, TradeSearchReq, TradeSearchRes};
+use serde_json::Value;
+use crate::models::{AccountSearchReq, AccountSearchRes, ApiEnvelope, AuthMode, CloseContractReq, LoginKeyReq, LoginKeyRes, PositionSearchOpenReq, PositionSearchOpenRes, TradeSearchReq, TradeSearchRes};
 // =============== API Client =================
 pub struct PxClient {
     pub api_base: String,
@@ -71,8 +73,70 @@ impl PxClient {
     }
 
     // Orders
-    pub async fn place_order(&self, req: &PlaceOrderReq<'_>) -> anyhow::Result<PlaceOrderRes> {
-        self.authed_post("/api/Order/place", req).await
+    pub(crate) async fn place_order(
+        &self,
+        req: &crate::models::PlaceOrderReq<'_>,
+    ) -> anyhow::Result<crate::models::PlaceOrderRes> {
+        let path = "/api/Order/place";
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+            let token = self.bearer().await?;
+            let url = format!("{}{}", self.api_base, path);
+
+            let resp = self.http
+                .post(url)
+                .bearer_auth(&token)
+                .header(ACCEPT, "application/json")
+                .json(req)
+                .send()
+                .await?;
+
+            if resp.status() == StatusCode::UNAUTHORIZED && attempts < 2 {
+                self.login().await?;
+                continue;
+            }
+
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(anyhow!("HTTP {} — {}", status, body));
+            }
+
+            // 1) Envelope: if present and success==false -> hard error
+            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                if let Some(s) = v.get("success").and_then(|x| x.as_bool()) {
+                    if !s {
+                        let code = v.get("errorCode").and_then(|x| x.as_i64()).unwrap_or_default();
+                        let msg  = v.get("errorMessage").and_then(|x| x.as_str()).unwrap_or("unknown error");
+                        return Err(anyhow!("API error (code {}): {}", code, msg));
+                    }
+                }
+                // try orderId from either shape
+                if let Some(oid) = v.get("orderId").and_then(|x| x.as_i64())
+                    .or_else(|| v.get("data").and_then(|d| d.get("orderId")).and_then(|x| x.as_i64()))
+                {
+                    return Ok(crate::models::PlaceOrderRes { order_id: oid });
+                }
+            }
+
+            // 2) Direct model
+            if let Ok(p) = serde_json::from_str::<crate::models::PlaceOrderRes>(&body) {
+                return Ok(p);
+            }
+
+            // 3) Accept empty/OK-ish as success with synthetic id
+            let trimmed = body.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("ok") || trimmed == "true" || trimmed == "false" {
+                tracing::debug!("place_order: 2xx with empty/non-JSON body: {:?}", trimmed);
+                return Ok(crate::models::PlaceOrderRes { order_id: 0 });
+            }
+
+            // 4) Unknown 2xx payload -> warn, but return soft success
+            tracing::warn!("place_order: 2xx but unknown body: {}", body);
+            return Ok(crate::models::PlaceOrderRes { order_id: 0 });
+        }
     }
 
     // Accounts

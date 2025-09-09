@@ -15,6 +15,13 @@ pub(crate) struct ApiEnvelope<T> {
     pub(crate) data: T,
 }
 
+// in models.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceOrderRes {
+    pub order_id: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LoginKeyReq<'a> {
     #[serde(rename = "userName")] pub user_name: &'a str,
@@ -100,13 +107,6 @@ pub struct AccountSearchRes {
     #[serde(default)]
     pub accounts: Vec<AccountSummary>,
 }
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlaceOrderRes {
-    pub order_id: i64,
-}
-
 
 // =============== Position Models =================
 #[derive(Debug, Clone, Serialize)]

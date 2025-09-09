@@ -8,6 +8,16 @@ use tokio::time::sleep;
 use crate::client::PxClient;
 use crate::models::{PlaceOrderReq, TradeSearchReq};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+static ORDER_TAG_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn unique_sync_tag(contract_id: &str, dest: i32, step: i32) -> String {
+    let seq = ORDER_TAG_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Guaranteed-unique per process; avoids "custom tag already in use"
+    format!("TCX:SYNC-LIVE:{}:{}:{}:{}", contract_id, dest, step, seq)
+}
+
 // =============== Copier Logic =================
 pub struct Copier {
     pub src: Arc<PxClient>,
@@ -122,19 +132,35 @@ impl Copier {
     async fn sync_dest_to_source_for_contract_live(&self, contract_id: &str) {
         // Leader net from cache (kept accurate via trade stream + startup seed)
         let src_key = (self.source_account_id, contract_id.to_string());
-        let src_net = { *self.src_pos.read().await.get(&src_key).unwrap_or(&0) };
+        let src_net = match self.src_pos.read().await.get(&src_key) {
+            None => return,
+            Some(net) => *net,
+        };
+
+        let max_step: i32 = std::env::var("PX_MAX_RESYNC")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(i32::MAX);
 
         for &dest in &self.dest_account_ids {
             let dest_net = self.get_live_dest_net(dest, contract_id).await;
             let diff = src_net - dest_net;
             if diff == 0 { continue; }
-            let side = if diff > 0 { 0 } else { 1 };
-            let size = diff.abs();
-            let tag = format!("TCX:SYNC-LIVE:{}:{}:{}", contract_id, dest, diff);
+
+            // Clamp correction per pass if requested
+            let step = diff.clamp(-max_step, max_step);
+            if step == 0 { continue; }
+
+            // Market order toward parity (0 = buy, 1 = sell)
+            let side = if step > 0 { 0 } else { 1 };
+            let size = step.abs();
+
+            // Always-unique tag (prevents API error code 2)
+            let tag = unique_sync_tag(contract_id, dest, step);
+
             let req = PlaceOrderReq {
                 account_id: dest,
                 contract_id,
-                r#type: 2,
+                r#type: 2, // market
                 side,
                 size,
                 limit_price: None,
@@ -143,14 +169,30 @@ impl Copier {
                 custom_tag: Some(tag),
                 linked_order_id: None,
             };
+
             match self.dest.place_order(&req).await {
                 Ok(resp) => {
-                    info!("Live sync {}: adjusted dest {} by {} (leader net {}) via order {}", contract_id, dest, diff, src_net, resp.order_id);
-                    // update cache to src_net to reduce subsequent diffs
+                    tracing::info!(
+                        "Live sync {}: adjusted dest {} by {} (leader net {}) via order {}",
+                        contract_id, dest, step, src_net, resp.order_id
+                    );
+                    // Bring cache to leader net to avoid oscillation
                     let mut dp = self.dest_pos.write().await;
-                    if src_net == 0 { dp.remove(&(dest, contract_id.to_string())); } else { dp.insert((dest, contract_id.to_string()), src_net); }
+                    if src_net == 0 {
+                        dp.remove(&(dest, contract_id.to_string()));
+                    } else {
+                        dp.insert((dest, contract_id.to_string()), src_net);
+                    }
+                    // Optionally tighten convergence if you have this helper:
+                    // self.converge_contract_quick(contract_id).await;
                 }
-                Err(e) => warn!("Live sync {}: failed to adjust dest {} by {}: {}", contract_id, dest, diff, e),
+                Err(e) => {
+                    // Other real errors (not the tag one—we preempted that)
+                    tracing::warn!(
+                        "Live sync {}: failed to adjust dest {} by {}: {}",
+                        contract_id, dest, step, e
+                    );
+                }
             }
         }
     }
