@@ -6,11 +6,12 @@
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, env, time::Duration, sync::Arc};
+use serde::{Deserialize, Serialize, de::{self, Deserializer}};
+use std::{collections::{HashMap, HashSet}, env, time::Duration, sync::Arc, fs};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+use dotenvy::dotenv;
 
 #[derive(Clone, Debug)]
 enum AuthMode {
@@ -22,12 +23,12 @@ struct Config {
     // SOURCE (read trades)
     src_api_base: String,
     src_auth: AuthMode,
-    source_account_id: i64,
+    source_account_id: String,
 
     // DESTINATION (place orders)
     dest_api_base: String,
     dest_auth: AuthMode,
-    dest_account_ids: Vec<i64>,
+    dest_account_ids: Vec<String>,
 
     // Polling
     poll_interval_ms: u64,
@@ -35,36 +36,57 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let env_parse_vec = |key: &str| -> Vec<i64> {
+        fn var_first(keys: &[&str]) -> Option<String> {
+            for k in keys {
+                if let Ok(v) = env::var(k) {
+                    let t = v.trim();
+                    if !t.is_empty() {
+                        return Some(t.to_string());
+                    }
+                }
+            }
+            None
+        }
+        let env_parse_vec = |key: &str| -> Vec<String> {
             env::var(key)
                 .unwrap_or_default()
                 .split(',')
-                .filter_map(|s| s.trim().parse::<i64>().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .collect()
         };
 
-        let src_api_base = env::var("PX_SRC_API_BASE").unwrap_or_else(|_| "https://gateway-api-demo.s2f.projectx.com".to_string());
-        let dest_api_base = env::var("PX_DEST_API_BASE").unwrap_or_else(|_| src_api_base.clone());
+        let src_api_base = var_first(&["PX_SRC_API_BASE", "PX_API_BASE"]).unwrap_or_else(|| "https://gateway-api-demo.s2f.projectx.com".to_string());
+        let dest_api_base = var_first(&["PX_DEST_API_BASE"]).unwrap_or_else(|| src_api_base.clone());
 
         // SOURCE uses API key auth
         let src_auth = AuthMode::ApiKey {
-            username: env::var("PX_SRC_USERNAME").unwrap_or_default(),
-            api_key: env::var("PX_SRC_API_KEY").unwrap_or_default(),
+            username: var_first(&["PX_SRC_USERNAME", "PX_SOURCE_USERNAME"]).unwrap_or_default(),
+            api_key: var_first(&["PX_SRC_API_KEY", "PX_SOURCE_API_KEY"]).unwrap_or_default(),
         };
 
         // DEST uses API key auth
         let dest_auth = AuthMode::ApiKey {
-            username: env::var("PX_DEST_USERNAME").unwrap_or_default(),
-            api_key: env::var("PX_DEST_API_KEY").unwrap_or_default(),
+            username: var_first(&["PX_DEST_USERNAME"]).unwrap_or_default(),
+            api_key: var_first(&["PX_DEST_API_KEY"]).unwrap_or_default(),
         };
 
         Ok(Self {
             src_api_base,
             src_auth,
-            source_account_id: env::var("PX_SRC_ACCOUNT").context("PX_SRC_ACCOUNT missing")?.parse()?,
+            source_account_id: var_first(&["PX_SRC_ACCOUNT", "PX_SOURCE_ACCOUNT", "PX_SOURCE_ACCOUNT_ID"]).context("Missing source account id (set PX_SRC_ACCOUNT or PX_SOURCE_ACCOUNT)")?,
             dest_api_base,
             dest_auth,
-            dest_account_ids: env_parse_vec("PX_DEST_ACCOUNTS"),
+            dest_account_ids: {
+                let list = env_parse_vec("PX_DEST_ACCOUNTS");
+                if !list.is_empty() {
+                    list
+                } else if let Some(one) = var_first(&["PX_DEST_ACCOUNT", "PX_DEST_ACCOUNT_ID"]) {
+                    vec![one]
+                } else {
+                    vec![]
+                }
+            },
             poll_interval_ms: env::var("PX_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
         })
     }
@@ -72,13 +94,14 @@ impl Config {
 
 // =============== API Models =================
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ApiEnvelope<T> {
     #[serde(default)]
     success: bool,
     #[serde(default)]
-    errorCode: i32,
+    error_code: i32,
     #[serde(default)]
-    errorMessage: Option<String>,
+    error_message: Option<String>,
     #[serde(default)]
     token: Option<String>,
     #[serde(flatten)]
@@ -86,46 +109,50 @@ struct ApiEnvelope<T> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct LoginKeyReq<'a> { userName: &'a str, apiKey: &'a str }
+struct LoginKeyReq<'a> {
+    #[serde(rename = "userName")] user_name: &'a str,
+    #[serde(rename = "apiKey")] api_key: &'a str,
+}
 #[derive(Debug, Clone, Deserialize)]
 struct LoginKeyRes {}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TradeSearchReq<'a> {
-    account_id: i64,
+    account_id: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     start_timestamp: Option<&'a str>, // RFC3339
     #[serde(skip_serializing_if = "Option::is_none")]
     end_timestamp: Option<&'a str>,
 }
 
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TradeRecord {
-    trade_id: i64,
-    order_id: i64,
-    account_id: i64,
+    id: i64,
+    account_id: i32,
     contract_id: String,
+    creation_timestamp: String, // RFC3339
+    price: f64,
+    #[serde(default)]
+    profit_and_loss: Option<f64>,
+    #[serde(default)]
+    fees: Option<f64>,
     side: i32, // 0=Bid(buy),1=Ask(sell)
     size: i32,
-    price: f64,
-    timestamp: String, // RFC3339
-    #[serde(default)]
-    custom_tag: Option<String>,
+    voided: bool,
+    order_id: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TradeSearchRes {
-    #[serde(default)]
-    trades: Vec<TradeRecord>,
-}
+struct TradeSearchRes { trades: Vec<TradeRecord> }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlaceOrderReq<'a> {
-    account_id: i64,
+    account_id: i32,
     contract_id: &'a str,
     r#type: i32, // 2 = Market (default copier behavior)
     side: i32,   // 0 buy, 1 sell
@@ -140,6 +167,28 @@ struct PlaceOrderReq<'a> {
     custom_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     linked_order_id: Option<i64>,
+}
+
+// =============== Account Models =================
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountSearchReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only_active_accounts: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountSummary {
+    id: i32,
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountSearchRes {
+    #[serde(default)]
+    accounts: Vec<AccountSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -167,7 +216,7 @@ impl PxClient {
             AuthMode::ApiKey { username, api_key } => (username, api_key),
         };
         let url = format!("{}/api/Auth/loginKey", self.api_base);
-        let body = LoginKeyReq { userName: username, apiKey: api_key };
+        let body = LoginKeyReq { user_name: username, api_key };
         let resp = self.http.post(url).json(&body).send().await?;
         if resp.status() != StatusCode::OK { return Err(anyhow!("loginKey http status {}", resp.status())); }
         let env: ApiEnvelope<LoginKeyRes> = resp.json().await?;
@@ -203,8 +252,8 @@ impl PxClient {
                 return Err(anyhow!("POST {} failed: {} — {}", path, status, txt));
             }
             let env: ApiEnvelope<T> = resp.json().await?;
-            if !env.success && env.errorCode != 0 {
-                return Err(anyhow!("API error {}: {:?}", env.errorCode, env.errorMessage));
+            if !env.success && env.error_code != 0 {
+                return Err(anyhow!("API error {}: {:?}", env.error_code, env.error_message));
             }
             return Ok(env.data);
         }
@@ -219,24 +268,30 @@ impl PxClient {
     async fn place_order(&self, req: &PlaceOrderReq<'_>) -> Result<PlaceOrderRes> {
         self.authed_post("/api/Order/place", req).await
     }
+
+    // Accounts
+    async fn search_accounts(&self, only_active: Option<bool>) -> Result<AccountSearchRes> {
+        let req = AccountSearchReq { only_active_accounts: only_active };
+        self.authed_post("/api/Account/search", &req).await
+    }
 }
 
 // =============== Copier Logic =================
 struct Copier {
     src: Arc<PxClient>,
     dest: Arc<PxClient>,
-    source_account_id: i64,
-    dest_account_ids: Vec<i64>,
+    source_account_id: i32,
+    dest_account_ids: Vec<i32>,
     poll_interval_ms: u64,
     seen: RwLock<HashSet<i64>>,
 
     // In-memory running positions, keyed by (accountId, contractId)
-    src_pos: RwLock<HashMap<(i64, String), i32>>,   // source net position per contract
-    dest_pos: RwLock<HashMap<(i64, String), i32>>,  // destination net position per contract (aggregated per dest account)
+    src_pos: RwLock<HashMap<(i32, String), i32>>,   // source net position per contract
+    dest_pos: RwLock<HashMap<(i32, String), i32>>,  // destination net position per contract (aggregated per dest account)
 }
 
 impl Copier {
-    fn new(src: Arc<PxClient>, dest: Arc<PxClient>, source_account_id: i64, dest_account_ids: Vec<i64>, poll_interval_ms: u64) -> Self {
+    fn new(src: Arc<PxClient>, dest: Arc<PxClient>, source_account_id: i32, dest_account_ids: Vec<i32>, poll_interval_ms: u64) -> Self {
         Self {
             src, dest, source_account_id, dest_account_ids, poll_interval_ms,
             seen: RwLock::new(HashSet::new()),
@@ -259,7 +314,7 @@ impl Copier {
         (prev, next)
     }
 
-    async fn update_dest_position(&self, dest_acct: i64, contract_id: &str, side: i32, size: i32) -> i32 {
+    async fn update_dest_position(&self, dest_acct: i32, contract_id: &str, side: i32, size: i32) -> i32 {
         let key = (dest_acct, contract_id.to_string());
         let mut map = self.dest_pos.write().await;
         let prev = *map.get(&key).unwrap_or(&0);
@@ -274,7 +329,7 @@ impl Copier {
         let src_flat = { !self.src_pos.read().await.contains_key(&src_key) };
         if !src_flat { return; }
 
-        let mut to_flatten: Vec<(i64, i32)> = Vec::new();
+        let mut to_flatten: Vec<(i32, i32)> = Vec::new();
         {
             let dest_map = self.dest_pos.read().await;
             for &dest in &self.dest_account_ids {
@@ -329,7 +384,7 @@ impl Copier {
                     for tr in res.trades {
                         // avoid duplicates
                         let mut seen = self.seen.write().await;
-                        if !seen.insert(tr.trade_id) { continue; }
+                        if !seen.insert(tr.id) { continue; }
                         drop(seen);
 
                         // Update source net position and, if now flat on this contract, trigger follower flattening
@@ -338,7 +393,7 @@ impl Copier {
                         // 2) Mirror to destination accounts
                         for &dest in &self.dest_account_ids {
                             if dest == tr.account_id { continue; }
-                            let tag = format!("TCX:{}:{}", tr.trade_id, dest); // unique per dest
+                            let tag = format!("TCX:{}:{}", tr.id, dest); // unique per dest
                             let place = PlaceOrderReq {
                                 account_id: dest,
                                 contract_id: &tr.contract_id,
@@ -353,11 +408,11 @@ impl Copier {
                             };
                             match self.dest.place_order(&place).await {
                                 Ok(resp) => {
-                                    info!("Mirrored trade {} to acct {} as order {}", tr.trade_id, dest, resp.order_id);
+                                    info!("Mirrored trade {} to acct {} as order {}", tr.id, dest, resp.order_id);
                                     // Track dest running position
                                     let _ = self.update_dest_position(dest, &tr.contract_id, tr.side, tr.size).await;
                                 },
-                                Err(e) => error!("Failed to mirror trade {} to acct {}: {}", tr.trade_id, dest, e),
+                                Err(e) => error!("Failed to mirror trade {} to acct {}: {}", tr.id, dest, e),
                             }
                         }
 
@@ -365,7 +420,7 @@ impl Copier {
                         self.flatten_dest_if_needed(&tr.contract_id).await;
 
                         // advance watermark
-                        since_rfc3339 = Some(tr.timestamp.clone());
+                        since_rfc3339 = Some(tr.creation_timestamp.clone());
                     }
                 }
                 Err(e) => {
@@ -378,8 +433,42 @@ impl Copier {
     }
 }
 
+// =============== Account ID Resolver Helper =================
+async fn resolve_account_id(client: &PxClient, id_or_name: &str) -> Result<i32> {
+    if let Ok(n) = id_or_name.parse::<i32>() { return Ok(n); }
+    let res = client.search_accounts(Some(true)).await?;
+    if let Some(acc) = res.accounts.into_iter().find(|a| a.name == id_or_name) {
+        Ok(acc.id)
+    } else {
+        Err(anyhow!("Account not found by name: {}", id_or_name))
+    }
+}
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenv().ok();
+    // Diagnostics: cwd and .env
+    if let Ok(cwd) = env::current_dir() { println!("cwd: {}", cwd.display()); }
+    match fs::metadata(".env") {
+        Ok(_) => println!(".env: found"),
+        Err(_) => println!(".env: not found in current directory"),
+    }
+    for k in [
+        "PX_SRC_API_BASE","PX_DEST_API_BASE","PX_SRC_USERNAME","PX_SRC_API_KEY","PX_SRC_ACCOUNT",
+        "PX_DEST_USERNAME","PX_DEST_API_KEY","PX_DEST_ACCOUNTS","PX_DEST_ACCOUNT","PX_DEST_ACCOUNT_ID","PX_POLL_MS",
+        "PX_SOURCE_USERNAME","PX_SOURCE_API_KEY","PX_SOURCE_ACCOUNT","PX_SOURCE_ACCOUNT_ID"
+    ] {
+        match env::var(k) {
+            Ok(v) => {
+                let summary = if k.ends_with("API_KEY") {
+                    format!("{}=****{}", k, &v.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>())
+                } else {
+                    v.clone()
+                };
+                println!("ENV {}: {}", k, if summary.len()>64 { format!("{}...", &summary[..64]) } else { summary });
+            },
+            Err(_) => println!("ENV {}: (unset)", k),
+        }
+    }
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let cfg = Config::from_env()?;
@@ -389,8 +478,17 @@ async fn main() -> Result<()> {
     // Pre-auth both
     let _ = src.login().await.context("src login failed")?;
     let _ = dest.login().await.context("dest login failed")?;
+    // Resolve source & destination account IDs (accept numeric or name strings)
+    let src_id = resolve_account_id(&src, &cfg.source_account_id).await?;
+    let mut dest_ids: Vec<i32> = Vec::new();
+    if cfg.dest_account_ids.is_empty() {
+        return Err(anyhow!("No destination accounts provided (set PX_DEST_ACCOUNTS or PX_DEST_ACCOUNT / PX_DEST_ACCOUNT_ID)"));
+    }
+    for s in &cfg.dest_account_ids {
+        dest_ids.push(resolve_account_id(&dest, s).await?);
+    }
 
-    let copier = Copier::new(src.clone(), dest.clone(), cfg.source_account_id, cfg.dest_account_ids.clone(), cfg.poll_interval_ms);
+    let copier = Copier::new(src.clone(), dest.clone(), src_id, dest_ids, cfg.poll_interval_ms);
     copier.run().await?;
 
     Ok(())
