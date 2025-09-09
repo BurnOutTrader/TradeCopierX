@@ -4,7 +4,6 @@
 For use with ProjectX API [projectx.com](https://projectx.com)
 
 ## Warning
-- Currently manually changing a trade on a follower will cause a synchronization error and will not be easily reconciled unless the leader is flattened
 - Alpha version:  not completely tested (use ProjectX risk control as a safeguard max size, max drawdown)
 - Only supports 1 follower prop firm, support for multiple firms to come.
 - Support for contract multiplier on followers to come.
