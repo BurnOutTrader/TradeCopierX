@@ -88,7 +88,7 @@ impl Config {
                     vec![]
                 }
             },
-            poll_interval_ms: env::var("PX_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
+            poll_interval_ms: env::var("PX_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50),
         })
     }
 }
@@ -340,6 +340,7 @@ struct Copier {
     source_account_id: i32,
     dest_account_ids: Vec<i32>,
     poll_interval_ms: u64,
+    sync_interval_ms: u64,
     seen: RwLock<HashSet<i64>>,
 
     // In-memory running positions, keyed by (accountId, contractId)
@@ -348,9 +349,9 @@ struct Copier {
 }
 
 impl Copier {
-    fn new(src: Arc<PxClient>, dest: Arc<PxClient>, source_account_id: i32, dest_account_ids: Vec<i32>, poll_interval_ms: u64) -> Self {
+    fn new(src: Arc<PxClient>, dest: Arc<PxClient>, source_account_id: i32, dest_account_ids: Vec<i32>, poll_interval_ms: u64, sync_interval_ms: u64) -> Self {
         Self {
-            src, dest, source_account_id, dest_account_ids, poll_interval_ms,
+            src, dest, source_account_id, dest_account_ids, poll_interval_ms, sync_interval_ms,
             seen: RwLock::new(HashSet::new()),
             src_pos: RwLock::new(HashMap::new()),
             dest_pos: RwLock::new(HashMap::new()),
@@ -401,7 +402,7 @@ impl Copier {
 
         // For contracts open on leader, ensure followers match leader size
         for contract_id in src_open.iter() {
-            self.sync_dest_to_source_for_contract(contract_id).await;
+            self.sync_dest_to_source_for_contract_live(contract_id).await;
         }
     }
 
@@ -426,6 +427,56 @@ impl Copier {
         let next = prev + Self::side_to_delta(side, size);
         if next == 0 { map.remove(&key); } else { map.insert(key, next); }
         next
+    }
+    async fn get_live_dest_net(&self, dest: i32, contract_id: &str) -> i32 {
+        match self.dest.search_open_positions(dest).await {
+            Ok(res) => {
+                for p in res.positions {
+                    if p.contract_id == contract_id { return p.size; }
+                }
+                0
+            }
+            Err(_) => {
+                // fallback to cache if API errors
+                *self.dest_pos.read().await.get(&(dest, contract_id.to_string())).unwrap_or(&0)
+            }
+        }
+    }
+
+    async fn sync_dest_to_source_for_contract_live(&self, contract_id: &str) {
+        // Leader net from cache (kept accurate via trade stream + startup seed)
+        let src_key = (self.source_account_id, contract_id.to_string());
+        let src_net = { *self.src_pos.read().await.get(&src_key).unwrap_or(&0) };
+
+        for &dest in &self.dest_account_ids {
+            let dest_net = self.get_live_dest_net(dest, contract_id).await;
+            let diff = src_net - dest_net;
+            if diff == 0 { continue; }
+            let side = if diff > 0 { 0 } else { 1 };
+            let size = diff.abs();
+            let tag = format!("TCX:SYNC-LIVE:{}:{}:{}", contract_id, dest, diff);
+            let req = PlaceOrderReq {
+                account_id: dest,
+                contract_id,
+                r#type: 2,
+                side,
+                size,
+                limit_price: None,
+                stop_price: None,
+                trail_price: None,
+                custom_tag: Some(tag),
+                linked_order_id: None,
+            };
+            match self.dest.place_order(&req).await {
+                Ok(resp) => {
+                    info!("Live sync {}: adjusted dest {} by {} (leader net {}) via order {}", contract_id, dest, diff, src_net, resp.order_id);
+                    // update cache to src_net to reduce subsequent diffs
+                    let mut dp = self.dest_pos.write().await;
+                    if src_net == 0 { dp.remove(&(dest, contract_id.to_string())); } else { dp.insert((dest, contract_id.to_string()), src_net); }
+                }
+                Err(e) => warn!("Live sync {}: failed to adjust dest {} by {}: {}", contract_id, dest, diff, e),
+            }
+        }
     }
 
     async fn flatten_dest_if_needed(&self, contract_id: &str) {
@@ -473,52 +524,6 @@ impl Copier {
         }
     }
 
-    async fn sync_dest_to_source_for_contract(&self, contract_id: &str) {
-        // Leader's net
-        let src_key = (self.source_account_id, contract_id.to_string());
-        let src_net = { *self.src_pos.read().await.get(&src_key).unwrap_or(&0) };
-
-        for &dest in &self.dest_account_ids {
-            let dest_key = (dest, contract_id.to_string());
-            let dest_net = { *self.dest_pos.read().await.get(&dest_key).unwrap_or(&0) };
-            let diff = src_net - dest_net; // >0 => need to BUY on follower; <0 => SELL on follower
-            if diff == 0 { continue; }
-
-            let side = if diff > 0 { 0 } else { 1 }; // 0=buy, 1=sell
-            let size = diff.abs();
-            let tag = format!("TCX:SYNC:{}:{}:{}", contract_id, dest, diff);
-
-            let req = PlaceOrderReq {
-                account_id: dest,
-                contract_id,
-                r#type: 2,
-                side,
-                size,
-                limit_price: None,
-                stop_price: None,
-                trail_price: None,
-                custom_tag: Some(tag),
-                linked_order_id: None,
-            };
-
-            match self.dest.place_order(&req).await {
-                Ok(resp) => {
-                    info!(
-                    "Sync {}: adjusted dest {} by {} (leader net {}) via order {}",
-                    contract_id, dest, diff, src_net, resp.order_id
-                );
-                    // Update follower cache to reflect new net
-                    let mut dp = self.dest_pos.write().await;
-                    if src_net == 0 { dp.remove(&dest_key); } else { dp.insert(dest_key, src_net); }
-                }
-                Err(e) => warn!(
-                "Sync {}: failed to adjust dest {} by {}: {}",
-                contract_id, dest, diff, e
-            ),
-            }
-        }
-    }
-
     async fn run(&self) -> Result<()> {
         info!("TradeCopierX starting");
         // A) Flatten stragglers first (don’t replay history)
@@ -526,6 +531,8 @@ impl Copier {
 
         // B) Only consume trades from now onwards
         let mut since_rfc3339: Option<String> = Some(Utc::now().to_rfc3339());
+
+        let mut last_sync = std::time::Instant::now();
 
         loop {
             // 1) Poll source trades
@@ -575,7 +582,7 @@ impl Copier {
                         self.flatten_dest_if_needed(&tr.contract_id).await;
 
                         // Keep followers exactly matched to leader net for this contract
-                        self.sync_dest_to_source_for_contract(&tr.contract_id).await;
+                        self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
 
                         // advance watermark
                         since_rfc3339 = Some(tr.creation_timestamp.clone());
@@ -584,6 +591,21 @@ impl Copier {
                 Err(e) => {
                     warn!("trade search error: {}", e);
                 }
+            }
+
+            if last_sync.elapsed() >= Duration::from_millis(self.sync_interval_ms) {
+                // Build a set of all contracts we have seen either on leader or followers
+                let mut all_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
+                {
+                    let sp = self.src_pos.read().await; for (_k, _v) in sp.iter() { all_contracts.insert(_k.1.clone()); }
+                }
+                {
+                    let dp = self.dest_pos.read().await; for (_k, _v) in dp.iter() { all_contracts.insert(_k.1.clone()); }
+                }
+                for cid in all_contracts.iter() {
+                    self.sync_dest_to_source_for_contract_live(cid).await;
+                }
+                last_sync = std::time::Instant::now();
             }
 
             sleep(Duration::from_millis(self.poll_interval_ms)).await;
@@ -646,7 +668,7 @@ async fn main() -> Result<()> {
         dest_ids.push(resolve_account_id(&dest, s).await?);
     }
 
-    let copier = Copier::new(src.clone(), dest.clone(), src_id, dest_ids, cfg.poll_interval_ms);
+    let copier = Copier::new(src.clone(), dest.clone(), src_id, dest_ids, cfg.poll_interval_ms, cfg.poll_interval_ms);
     copier.run().await?;
 
     Ok(())
