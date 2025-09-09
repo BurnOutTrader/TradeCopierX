@@ -214,6 +214,7 @@ struct PositionSearchOpenReq { account_id: i32 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 struct PositionRecord {
     id: i64,
     account_id: i32,
