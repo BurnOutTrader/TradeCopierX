@@ -5,7 +5,8 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use chrono::Utc;
 use tokio::time::sleep;
-use crate::models::{PlaceOrderReq, PxClient, TradeSearchReq};
+use crate::client::PxClient;
+use crate::models::{PlaceOrderReq, TradeSearchReq};
 
 // =============== Copier Logic =================
 pub struct Copier {

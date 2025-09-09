@@ -7,13 +7,14 @@
 mod models;
 mod config;
 mod copier;
+mod client;
 
 use anyhow::{anyhow, Context, Result};
 use std::{env, fs, sync::Arc};
 use dotenvy::dotenv;
 use config::Config;
 use copier::Copier;
-use models::PxClient;
+use client::PxClient;
 
 // =============== Account ID Resolver Helper =================
 async fn resolve_account_id(client: &PxClient, id_or_name: &str) -> Result<i32> {
