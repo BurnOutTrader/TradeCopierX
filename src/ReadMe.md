@@ -98,18 +98,16 @@ There are multiple secure ways to provide secrets to TradeCopierX:
 
 ```env
 # Example .env file for TradeCopierX (FAKE values – do not use in production!)
-PX_SOURCE_USERNAME=source_user
-PX_SOURCE_API_KEY=abc123sourceapikey
-PX_SOURCE_ACCOUNT_ID=source_account_001
+PX_SRC_API_BASE=https://api.topstepx.com
+PX_SOURCE_USERNAME=
+PX_SOURCE_API_KEY=
+PX_SOURCE_ACCOUNT_ID=
 
-PX_DEST_USERNAME=dest_user
-PX_DEST_API_KEY=xyz789destapikey
-PX_DEST_ACCOUNT_ID=dest_account_001
-
-# Optional settings
-PX_POLL_MS=3000
-# For multiple destinations:
-# PX_DEST_ACCOUNTS=dest_account_001,dest_account_002
+PX_DEST_API_BASE=https://api.alphaticks.projectx.com
+PX_DEST_USERNAME=
+PX_DEST_API_KEY=
+PX_DEST_ACCOUNT_ID=
+PX_DEST_ACCOUNTS=
 ```
 
 ---
