@@ -64,12 +64,15 @@ There are multiple secure ways to provide secrets to TradeCopierX:
 
 ## Running the Project
 
-1. **Build the project:**
+1. **Install Rust**
+   https://www.rust-lang.org/tools/install
+
+2. **Build the project:**
    ```
    cargo build --release
    ```
 
-2. **Run the executable** with environment variables set (using a `.env` file, or exported in your shell):
+3. **Run the executable** with environment variables set (using a `.env` file, or exported in your shell):
    ```
    ./target/release/tradecopierx
    ```
