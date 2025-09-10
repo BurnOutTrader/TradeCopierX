@@ -1,6 +1,6 @@
 # TradeCopierX
 
-**TradeCopierX** is a tool for copying trades in real time from one trading account ("source") to one or more destination accounts. It is designed for algorithmic trading, portfolio management, and scenarios where you want to mirror trades between accounts on the same or different brokers/exchanges.
+**TradeCopierX** is a tool for copying trades in real time from one trading account ("source") to one or more destination accounts.
 For use with ProjectX API [projectx.com](https://projectx.com)
 
 ## Warning
