@@ -15,7 +15,6 @@ pub(crate) struct ApiEnvelope<T> {
     pub(crate) data: T,
 }
 
-// in models.rs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaceOrderRes {
