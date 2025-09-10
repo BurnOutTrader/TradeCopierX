@@ -48,34 +48,52 @@ impl Copier {
         use std::collections::HashSet;
         use tracing::{info, warn};
 
-        // 1) Build set of contracts that are OPEN on the leader
+        // 1) Build set of contracts that are OPEN on the leader, and seed source cache with SIGNED net
         let mut src_open: HashSet<String> = HashSet::new();
         match self.src.search_open_positions(self.source_account_id).await {
             Ok(res) => {
                 for p in res.positions {
                     src_open.insert(p.contract_id.clone());
-                    // Seed source pos cache
+                    // SIGNED net: type 0 = long (+), 1 = short (-)
+                    let net = if p.r#type == 0 { p.size } else { -p.size };
                     let mut sp = self.src_pos.write().await;
-                    sp.insert((self.source_account_id, p.contract_id.clone()), p.size);
+                    if net == 0 {
+                        sp.remove(&(self.source_account_id, p.contract_id.clone()));
+                    } else {
+                        sp.insert((self.source_account_id, p.contract_id.clone()), net);
+                    }
                 }
             }
             Err(e) => warn!("startup reconcile: failed to load source positions: {}", e),
         }
 
-        // 2) For each follower, close any contract not open on leader
+        // 2) For each follower, seed follower cache with SIGNED nets and
+        //    close any contract not open on leader (leader is flat there)
         for &dest in &self.dest_account_ids {
             match self.dest.search_open_positions(dest).await {
                 Ok(res) => {
                     for p in res.positions {
+                        let net = if p.r#type == 0 { p.size } else { -p.size };
                         // seed follower cache
                         {
                             let mut dp = self.dest_pos.write().await;
-                            dp.insert((dest, p.contract_id.clone()), p.size);
+                            if net == 0 {
+                                dp.remove(&(dest, p.contract_id.clone()));
+                            } else {
+                                dp.insert((dest, p.contract_id.clone()), net);
+                            }
                         }
+                        // If leader is flat on this contract, close follower side
                         if !src_open.contains(&p.contract_id) {
-                            info!("Startup reconcile: closing {} on dest {} (leader flat)", p.contract_id, dest);
+                            info!(
+                            "Startup reconcile: closing {} on dest {} (leader flat)",
+                            p.contract_id, dest
+                        );
                             if let Err(e) = self.dest.close_contract(dest, &p.contract_id).await {
-                                warn!("Failed to close {} on dest {} during startup reconcile: {}", p.contract_id, dest, e);
+                                warn!(
+                                "Failed to close {} on dest {} during startup reconcile: {}",
+                                p.contract_id, dest, e
+                            );
                             } else {
                                 let mut dp = self.dest_pos.write().await;
                                 dp.remove(&(dest, p.contract_id.clone()));
@@ -87,7 +105,7 @@ impl Copier {
             }
         }
 
-        // For contracts open on leader, ensure followers match leader size
+        // 3) For contracts OPEN on leader, bring followers to the exact leader size
         for contract_id in src_open.iter() {
             self.sync_dest_to_source_for_contract_live(contract_id).await;
         }
@@ -118,14 +136,18 @@ impl Copier {
     async fn get_live_dest_net(&self, dest: i32, contract_id: &str) -> i32 {
         match self.dest.search_open_positions(dest).await {
             Ok(res) => {
+                let mut net = 0;
                 for p in res.positions {
-                    if p.contract_id == contract_id { return p.size; }
+                    if p.contract_id == contract_id {
+                        net += if p.r#type == 0 { p.size } else { -p.size };
+                    }
                 }
-                0
+                net
             }
             Err(_) => {
-                // fallback to cache if API errors
-                *self.dest_pos.read().await.get(&(dest, contract_id.to_string())).unwrap_or(&0)
+                *self.dest_pos.read().await
+                    .get(&(dest, contract_id.to_string()))
+                    .unwrap_or(&0)
             }
         }
     }
