@@ -4,14 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-thiserror = "1"
-tracing = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock","std"] }
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-dotenvy = "*"
-ahash = "*"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time"] }
+reqwest = { version = "0.12.23", features = ["json", "gzip", "brotli", "deflate", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+anyhow = "1.0.99"
+tracing = "0.1.41"
+chrono = { version = "0.4.42", default-features = false, features = ["clock","std"] }
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
+dotenvy = "0.15.7"
+ahash = "0.8.12"
