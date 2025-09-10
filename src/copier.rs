@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -7,6 +7,7 @@ use chrono::Utc;
 use tokio::time::sleep;
 use crate::client::PxClient;
 use crate::models::{PlaceOrderReq, TradeSearchReq};
+use ahash::AHashMap;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 static ORDER_TAG_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -29,8 +30,8 @@ pub struct Copier {
     pub seen: RwLock<HashSet<i64>>,
 
     // In-memory running positions, keyed by (accountId, contractId)
-    pub src_pos: RwLock<HashMap<(i32, String), i32>>,   // source net position per contract
-    pub dest_pos: RwLock<HashMap<(i32, String), i32>>,  // destination net position per contract (aggregated per dest account)
+    pub src_pos: RwLock<AHashMap<(i32, String), i32>>,   // source net position per contract
+    pub dest_pos: RwLock<AHashMap<(i32, String), i32>>,  // destination net position per contract (aggregated per dest account)
 }
 
 impl Copier {
@@ -38,8 +39,8 @@ impl Copier {
         Self {
             src, dest, source_account_id, dest_account_ids, poll_interval_ms, sync_interval_ms,
             seen: RwLock::new(HashSet::new()),
-            src_pos: RwLock::new(HashMap::new()),
-            dest_pos: RwLock::new(HashMap::new()),
+            src_pos: RwLock::new(AHashMap::new()),
+            dest_pos: RwLock::new(AHashMap::new()),
         }
     }
 
