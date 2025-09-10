@@ -71,7 +71,7 @@ impl Config {
                     vec![]
                 }
             },
-            poll_interval_ms: env::var("PX_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50),
+            poll_interval_ms: env::var("PX_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(250),
         })
     }
 }
