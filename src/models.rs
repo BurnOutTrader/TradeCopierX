@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-// =============== API Models =================
+
+// ======= API Envelope =======
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApiEnvelope<T> {
@@ -15,46 +16,19 @@ pub(crate) struct ApiEnvelope<T> {
     pub(crate) data: T,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlaceOrderRes {
-    pub order_id: i64,
+// ======= Auth =======
+#[derive(Clone, Debug)]
+pub enum AuthMode {
+    ApiKey { username: String, api_key: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct LoginKeyReq<'a> {
-    #[serde(rename = "userName")] pub user_name: &'a str,
-    #[serde(rename = "apiKey")] pub api_key: &'a str,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct LoginKeyRes {}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(unused)]
-pub struct TradeRecord {
-    pub id: i64,
-    pub account_id: i32,
-    pub contract_id: String,
-    pub creation_timestamp: String, // RFC3339
-    pub price: f64,
-    #[serde(default)]
-    pub profit_and_loss: Option<f64>,
-    #[serde(default)]
-    pub fees: Option<f64>,
-    pub side: i32, // 0=Bid(buy),1=Ask(sell)
-    pub size: i32,
-    pub voided: bool,
-    pub order_id: i64,
-}
-
+// ======= Orders =======
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaceOrderReq<'a> {
     pub account_id: i32,
     pub contract_id: &'a str,
-    pub r#type: i32, // 2 = Market (default copier behavior)
+    pub r#type: i32, // 2 = Market
     pub side: i32,   // 0 buy, 1 sell
     pub size: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +43,13 @@ pub struct PlaceOrderReq<'a> {
     pub linked_order_id: Option<i64>,
 }
 
-// =============== Account Models =================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceOrderRes {
+    pub order_id: i64,
+}
+
+// ======= Accounts =======
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSearchReq {
@@ -91,20 +71,19 @@ pub struct AccountSearchRes {
     pub accounts: Vec<AccountSummary>,
 }
 
-// =============== Position Models =================
+// ======= Positions =======
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionSearchOpenReq { pub(crate) account_id: i32 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(unused)]
 pub struct PositionRecord {
     pub id: i64,
     pub account_id: i32,
     pub contract_id: String,
     pub creation_timestamp: String,
-    pub r#type: i32,        // direction flag from API
+    pub r#type: i32,        // PositionType enum: Long=1, Short=2
     pub size: i32,          // net size
     pub average_price: f64,
 }
@@ -115,9 +94,23 @@ pub struct PositionSearchOpenRes { pub positions: Vec<PositionRecord> }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CloseContractReq<'a> {pub  account_id: i32, pub contract_id: &'a str }
+pub struct CloseContractReq<'a> { pub account_id: i32, pub contract_id: &'a str }
 
-#[derive(Clone, Debug)]
-pub(crate) enum AuthMode {
-    ApiKey { username: String, api_key: String },
+// ======= Trades (RTC) =======
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeRecord {
+    pub id: i64,
+    pub account_id: i32,
+    pub contract_id: String,
+    pub creation_timestamp: String, // RFC3339
+    pub price: f64,
+    #[serde(default)]
+    pub profit_and_loss: Option<f64>,
+    #[serde(default)]
+    pub fees: Option<f64>,
+    pub side: i32, // 0=Bid(buy),1=Ask(sell)
+    pub size: i32,
+    pub voided: bool,
+    pub order_id: i64,
 }

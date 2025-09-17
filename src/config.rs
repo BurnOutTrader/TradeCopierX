@@ -1,80 +1,58 @@
+use anyhow::{anyhow, Result};
 use std::env;
-use anyhow::Context;
-use crate::models::AuthMode;
 
 #[derive(Clone, Debug)]
-pub(crate) struct Config {
-    // SOURCE (read trades)
-    pub(crate) src_api_base: String,
-    pub(crate) src_auth: AuthMode,
-    pub(crate) source_account_id: String,
+pub struct Config {
+    pub src_api_base: String,
+    pub dest_api_base: String,
 
-    // DESTINATION (place orders)
-    pub(crate) dest_api_base: String,
-    pub(crate) dest_auth: AuthMode,
-    pub(crate) dest_account_ids: Vec<String>,
+    pub src_username: String,
+    pub src_api_key: String,
+    pub dest_username: String,
+    pub dest_api_key: String,
 
-    // Polling
-    pub(crate) poll_interval_ms: u64,
+    // Account identifiers: can be numeric IDs or exact names
+    pub source_account_id: String,
+    pub dest_account_ids: Vec<String>,
+
 }
 
 impl Config {
-    pub(crate) fn from_env() -> anyhow::Result<Self> {
-        fn var_first(keys: &[&str]) -> Option<String> {
-            for k in keys {
-                if let Ok(v) = env::var(k) {
-                    let t = v.trim();
-                    if !t.is_empty() {
-                        return Some(t.to_string());
-                    }
-                }
-            }
-            None
+    pub fn from_env() -> Result<Self> {
+        let src_api_base = env::var("PX_SRC_API_BASE")?;
+        let dest_api_base = env::var("PX_DEST_API_BASE")?;
+
+        let src_username = env::var("PX_SRC_USERNAME")?;
+        let src_api_key  = env::var("PX_SRC_API_KEY")?;
+        let dest_username= env::var("PX_DEST_USERNAME")?;
+        let dest_api_key = env::var("PX_DEST_API_KEY")?;
+
+        let source_account_id = env::var("PX_SOURCE_ACCOUNT_ID")
+            .or_else(|_| env::var("PX_SOURCE_ACCOUNT"))?; // fallback
+        let dest_accounts_raw = env::var("PX_DEST_ACCOUNTS")
+            .or_else(|_| env::var("PX_DEST_ACCOUNT").map(|s| s.to_string()))
+            .or_else(|_| env::var("PX_DEST_ACCOUNT_ID").map(|s| s.to_string()))
+            .map_err(|_| anyhow!("Provide PX_DEST_ACCOUNTS (comma list) or PX_DEST_ACCOUNT / PX_DEST_ACCOUNT_ID"))?;
+
+        let dest_account_ids: Vec<String> = dest_accounts_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if dest_account_ids.is_empty() {
+            return Err(anyhow!("No destination accounts provided."));
         }
-        let env_parse_vec = |key: &str| -> Vec<String> {
-            env::var(key)
-                .unwrap_or_default()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
-
-        let src_api_base = var_first(&["PX_SRC_API_BASE", "PX_API_BASE"]).unwrap_or_else(|| "https://gateway-api-demo.s2f.projectx.com".to_string());
-        let dest_api_base = var_first(&["PX_DEST_API_BASE"]).unwrap_or_else(|| src_api_base.clone());
-
-        // SOURCE uses API key auth
-        let src_auth = AuthMode::ApiKey {
-            username: var_first(&["PX_SRC_USERNAME", "PX_SOURCE_USERNAME"]).unwrap_or_default(),
-            api_key: var_first(&["PX_SRC_API_KEY", "PX_SOURCE_API_KEY"]).unwrap_or_default(),
-        };
-
-        // DEST uses API key auth
-        let dest_auth = AuthMode::ApiKey {
-            username: var_first(&["PX_DEST_USERNAME"]).unwrap_or_default(),
-            api_key: var_first(&["PX_DEST_API_KEY"]).unwrap_or_default(),
-        };
 
         Ok(Self {
             src_api_base,
-            src_auth,
-            source_account_id: var_first(&["PX_SRC_ACCOUNT", "PX_SOURCE_ACCOUNT", "PX_SOURCE_ACCOUNT_ID"]).context("Missing source account id (set PX_SRC_ACCOUNT or PX_SOURCE_ACCOUNT)")?,
             dest_api_base,
-            dest_auth,
-            dest_account_ids: {
-                let list = env_parse_vec("PX_DEST_ACCOUNTS");
-                if !list.is_empty() {
-                    list
-                } else if let Some(one) = var_first(&["PX_DEST_ACCOUNT", "PX_DEST_ACCOUNT_ID"]) {
-                    vec![one]
-                } else {
-                    vec![]
-                }
-            },
-            poll_interval_ms: {
-                let ms = env::var("PX_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-                ms.max(500)
-            },
+            src_username,
+            src_api_key,
+            dest_username,
+            dest_api_key,
+            source_account_id,
+            dest_account_ids,
         })
     }
 }

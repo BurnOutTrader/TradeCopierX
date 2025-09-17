@@ -30,7 +30,7 @@ TradeCopierX relies on several environment variables for secure configuration. *
 
 ### Optional Environment Variables
 
-- `PX_POLL_MS` – How often (in milliseconds) to poll the source account for new trades. Default: `50` (50 milliseconds).
+- `PX_POLL_MS` – How often (in milliseconds) to poll the source account for new trades. Default: `500` (50 milliseconds).
 - `PX_DEST_ACCOUNTS` – (Optional) Comma-separated list of destination account IDs to copy trades to multiple accounts.
 
 ---

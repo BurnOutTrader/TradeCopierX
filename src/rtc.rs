@@ -1,15 +1,16 @@
-use std::sync::Arc;
+use crate::models::TradeRecord;
+use crate::client::PxClient;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{client::PxClient, models::TradeRecord};
-
-// Events we care about from the user hub
 #[derive(Debug, Clone)]
 pub enum RtcEvent {
     Trade(TradeRecord),
     SrcPosition { contract_id: String, signed_net: i32 },
+    DestPosition { account_id: i32, contract_id: String, signed_net: i32 },
 }
 
 fn default_rtc_base() -> String {
@@ -18,7 +19,6 @@ fn default_rtc_base() -> String {
 
 fn user_hub_url(token: &str) -> String {
     let base = default_rtc_base();
-    // Ensure wss scheme and append /hubs/user
     let url = base.trim_end_matches('/');
     let wss = url.replace("http://", "ws://").replace("https://", "wss://");
     let enc_tok = urlencoding::encode(token);
@@ -36,9 +36,8 @@ struct ServerInvocation {
 }
 
 fn frame_json(v: &serde_json::Value) -> Message {
-    // SignalR JSON protocol frames with 0x1E (record separator)
     let mut s = v.to_string();
-    s.push('\u{001e}');
+    s.push('\u{001e}'); // SignalR record separator
     Message::Text(s)
 }
 
@@ -46,21 +45,18 @@ pub async fn start_userhub(
     src: Arc<PxClient>,
     source_account_id: i32,
     dest_account_ids: Vec<i32>,
-    dest_pos_tx: mpsc::Sender<(i32, String, i32)>, // (destId, contractId, signedNet)
 ) -> anyhow::Result<mpsc::Receiver<RtcEvent>> {
-    let (tx, rx) = mpsc::channel::<RtcEvent>(1024);
+    let (tx, rx) = mpsc::channel::<RtcEvent>(2048);
 
     tokio::spawn(async move {
-        use futures_util::{SinkExt, StreamExt};
         use tokio::time::{sleep, Duration};
-        use tokio_tungstenite::tungstenite::Message;
 
         let mut attempt: u32 = 0;
 
         loop {
             attempt = attempt.saturating_add(1);
 
-            // 1) Bearer (refresh if needed)
+            // 1) token
             let token = match src.bearer().await {
                 Ok(t) => t,
                 Err(e) => {
@@ -70,23 +66,23 @@ pub async fn start_userhub(
                 }
             };
 
-            // 2) Connect
+            // 2) connect
             let url = user_hub_url(&token);
             tracing::info!("RTC: connecting to {}", url);
 
             match tokio_tungstenite::connect_async(url).await {
                 Ok((mut ws, _resp)) => {
                     tracing::info!("RTC: connected");
-                    attempt = 0; // reset backoff
+                    attempt = 0;
 
-                    // 3) Handshake
+                    // 3) handshake
                     let hs = serde_json::json!({ "protocol": "json", "version": 1 });
                     if ws.send(frame_json(&hs)).await.is_err() {
                         tracing::warn!("RTC: failed to send handshake; reconnecting");
                         continue;
                     }
 
-                    // 4) Subscriptions
+                    // 4) subscribe: source full, dest positions
                     let mut subs = vec![
                         serde_json::json!({"type":1, "target":"SubscribeAccounts", "arguments": []}),
                         serde_json::json!({"type":1, "target":"SubscribeOrders",   "arguments": [source_account_id]}),
@@ -103,7 +99,7 @@ pub async fn start_userhub(
                         }
                     }
 
-                    // 5) Read loop
+                    // 5) read loop
                     while let Some(msg) = ws.next().await {
                         match msg {
                             Ok(Message::Text(txt)) => {
@@ -127,29 +123,27 @@ pub async fn start_userhub(
                                                         && let Some(first) = args.get(0)
                                                         && let Some(acc) = first.get("accountId").and_then(|v| v.as_i64())
                                                         && let Some(cid) = first.get("contractId").and_then(|v| v.as_str())
-                                                        && let Some(pt)  = first.get("type").and_then(|v| v.as_i64())
+                                                        && let Some(pt)  = first.get("type").and_then(|v| v.as_i64())  // 1=Long 2=Short
                                                         && let Some(sz)  = first.get("size").and_then(|v| v.as_i64())
                                                     {
-                                                        let acc_i32 = acc as i32;
                                                         let signed = match pt {
-                                                            1 =>  sz as i32,  // Long
-                                                            2 => -(sz as i32), // Short
-                                                            _ => 0,
+                                                            1 =>  sz as i32,
+                                                            2 => -(sz as i32),
+                                                            _ => 0
                                                         };
+                                                        let acc_i32 = acc as i32;
                                                         if acc_i32 == source_account_id {
                                                             let _ = tx.send(RtcEvent::SrcPosition { contract_id: cid.to_string(), signed_net: signed }).await;
                                                         } else if dest_account_ids.iter().any(|&d| d == acc_i32) {
-                                                            let _ = dest_pos_tx.send((acc_i32, cid.to_string(), signed)).await;
+                                                            let _ = tx.send(RtcEvent::DestPosition { account_id: acc_i32, contract_id: cid.to_string(), signed_net: signed }).await;
                                                         }
                                                     }
                                                 }
                                                 _ => {}
                                             }
                                         }
-                                        Ok(_) => {} // ignore other SignalR message types
-                                        Err(_) => {
-                                            tracing::debug!("RTC: unparsed frame: {}", p);
-                                        }
+                                        Ok(_) => {}
+                                        Err(_) => { tracing::debug!("RTC: unparsed frame: {}", p); }
                                     }
                                 }
                             }
@@ -172,9 +166,9 @@ pub async fn start_userhub(
                 }
             }
 
-            // 6) Exponential backoff (cap 10s)
+            // backoff (cap 10s)
             let backoff_ms = (500u64 * (1u64 << (attempt.min(6)))).min(10_000);
-            sleep(Duration::from_millis(backoff_ms)).await;
+            sleep(std::time::Duration::from_millis(backoff_ms)).await;
         }
     });
 
