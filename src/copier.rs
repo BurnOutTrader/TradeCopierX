@@ -1,19 +1,19 @@
-use crate::client::{PxClient, set_live_mode_live};
-use crate::models::{PlaceOrderReq, PositionSearchOpenRes};
-use crate::rtc::{RtcEvent, start_userhub};
+use crate::client::PxClient;
+use crate::models::{PlaceOrderReq, PositionRecord};
 use ahash::AHashMap;
+use anyhow::Result;
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
-use tracing::{info, warn, error};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 static ORDER_TAG_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[inline]
 fn unique_sync_tag(contract_id: &str, dest: i32, step: i32) -> String {
     let seq = ORDER_TAG_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("TCX:SYNC-LIVE:{}:{}:{}:{}", contract_id, dest, step, seq)
+    format!("TCX:SYNC:{}:{}:{}:{}", contract_id, dest, step, seq)
 }
 
 pub struct Copier {
@@ -21,88 +21,117 @@ pub struct Copier {
     pub dest: Arc<PxClient>,
     pub source_account_id: i32,
     pub dest_account_ids: Vec<i32>,
+    pub max_resync_step: i32,
+    pub source_poll_ms: u64,
+    pub enable_follower_drift_check: bool,
 
     // In-memory running positions, keyed by (accountId, contractId)
-    pub src_pos: RwLock<AHashMap<(i32, String), i32>>,   // source net per contract
-    pub dest_pos: RwLock<AHashMap<(i32, String), i32>>,  // follower net per contract
-    pub seen: RwLock<HashSet<i64>>,
+    pub src_pos: Arc<RwLock<AHashMap<(i32, String), i32>>>,   // source net position per contract
+    pub dest_pos: Arc<RwLock<AHashMap<(i32, String), i32>>>,  // destination net position per contract
 }
 
 impl Copier {
-    pub fn new(src: Arc<PxClient>, dest: Arc<PxClient>, source_account_id: i32, dest_account_ids: Vec<i32>) -> Self {
+    pub fn new(
+        src: Arc<PxClient>,
+        dest: Arc<PxClient>,
+        source_account_id: i32,
+        dest_account_ids: Vec<i32>,
+        max_resync_step: i32,
+        source_poll_ms: u64,
+        enable_follower_drift_check: bool,
+    ) -> Self {
         Self {
-            src, dest, source_account_id, dest_account_ids,
-            src_pos: RwLock::new(AHashMap::new()),
-            dest_pos: RwLock::new(AHashMap::new()),
-            seen: RwLock::new(HashSet::new()),
+            src, dest, source_account_id, dest_account_ids, max_resync_step, source_poll_ms,
+            enable_follower_drift_check,
+            src_pos: Arc::new(RwLock::new(AHashMap::new())),
+            dest_pos: Arc::new(RwLock::new(AHashMap::new())),
         }
     }
 
-    fn signed_from_api(dir: i32, size: i32) -> i32 {
-        // PositionRecord.type uses PositionType (1=Long,2=Short)
-        if dir == 1 { size } else { -size }
-    }
-    fn side_to_delta(side: i32, size: i32) -> i32 {
-        // TradeRecord.side: 0=buy -> +, 1=sell -> -
-        if side == 0 { size } else { -size }
+    #[inline]
+    fn signed_net_from_record(p: &PositionRecord) -> i32 {
+        // PositionType per docs: 1=Long, 2=Short
+        match p.r#type { 1 => p.size, 2 => -p.size, _ => 0 }
     }
 
-    // ===== One-time reconcile with REST =====
-    pub async fn reconcile_once(&self) {
-        use std::collections::HashSet;
-        info!("Startup reconcile: loading source/dest open positions via REST");
+    pub async fn reconcile_on_startup(&self) {
+        info!("Startup reconcile: begin");
 
-        // Source
-        let mut leader_open: HashSet<String> = HashSet::new();
+        // 1) Load leader open positions; seed src cache
+        let mut src_open: HashSet<String> = HashSet::new();
         match self.src.search_open_positions(self.source_account_id).await {
-            Ok(PositionSearchOpenRes { positions }) => {
+            Ok(res) => {
                 let mut sp = self.src_pos.write().await;
-                for p in positions {
-                    leader_open.insert(p.contract_id.clone());
-                    let net = Self::signed_from_api(p.r#type, p.size);
-                    if net == 0 {
-                        sp.remove(&(self.source_account_id, p.contract_id.clone()));
-                    } else {
+                sp.clear();
+                for p in res.positions {
+                    src_open.insert(p.contract_id.clone());
+                    let net = Self::signed_net_from_record(&p);
+                    if net != 0 {
                         sp.insert((self.source_account_id, p.contract_id.clone()), net);
                     }
                 }
             }
-            Err(e) => warn!("Startup: failed to load source positions: {}", e),
+            Err(e) => warn!("Startup reconcile: failed to load source positions: {}", e),
         }
 
-        // Followers
+        // 2) For each follower, seed follower cache and close any contract leader is flat on
         for &dest in &self.dest_account_ids {
             match self.dest.search_open_positions(dest).await {
-                Ok(PositionSearchOpenRes { positions }) => {
-                    for p in positions {
-                        let net = Self::signed_from_api(p.r#type, p.size);
-                        {
-                            let mut dp = self.dest_pos.write().await;
-                            if net == 0 {
-                                dp.remove(&(dest, p.contract_id.clone()));
-                            } else {
+                Ok(res) => {
+                    // seed cache
+                    {
+                        let mut dp = self.dest_pos.write().await;
+                        // clear only this account's entries
+                        dp.retain(|(acc, _), _| *acc != dest);
+                        for p in &res.positions {
+                            let net = Self::signed_net_from_record(p);
+                            if net != 0 {
                                 dp.insert((dest, p.contract_id.clone()), net);
                             }
                         }
-                        // If leader is flat, close follower
-                        if !leader_open.contains(&p.contract_id) && net != 0 {
-                            info!("Startup: closing {} on follower {} (leader flat)", p.contract_id, dest);
-                            if let Err(e) = self.dest.close_contract(dest, &p.contract_id).await {
-                                warn!("Startup: close {} on {} failed: {}", p.contract_id, dest, e);
-                            } else {
-                                let mut dp = self.dest_pos.write().await;
-                                dp.remove(&(dest, p.contract_id.clone()));
+                    }
+                    // if leader flat on contract, close follower side
+                    for p in res.positions {
+                        if !src_open.contains(&p.contract_id) {
+                            let net = Self::signed_net_from_record(&p);
+                            if net != 0 {
+                                info!("Startup reconcile: closing {} on dest {} (leader flat)", p.contract_id, dest);
+                                if let Err(e) = self.dest.close_contract(dest, &p.contract_id).await {
+                                    warn!("Failed to close {} on dest {}: {}", p.contract_id, dest, e);
+                                } else {
+                                    let mut dp = self.dest_pos.write().await;
+                                    dp.remove(&(dest, p.contract_id.clone()));
+                                }
                             }
                         }
                     }
                 }
-                Err(e) => warn!("Startup: failed to load dest {} positions: {}", dest, e),
+                Err(e) => warn!("Startup reconcile: failed to load dest {} positions: {}", dest, e),
             }
         }
 
-        // Bring followers to exact leader size for all leader-open contracts
-        for cid in leader_open {
-            self.sync_followers_to_leader(&cid).await;
+        // 3) For contracts open on leader, bring followers to leader size
+        for contract_id in src_open.iter() {
+            self.sync_dest_to_source_for_contract(contract_id).await;
+        }
+
+        info!("Startup reconcile: complete");
+    }
+
+    #[inline]
+    fn delta(side: i32, size: i32) -> i32 {
+        // 0=Bid/buy => +size, 1=Ask/sell => -size
+        if side == 0 { size } else { -size }
+    }
+
+    async fn set_src_snapshot(&self, snapshot: &[(String, i32)]) {
+        let mut sp = self.src_pos.write().await;
+        // replace everything for source account
+        sp.retain(|(acc, _), _| *acc != self.source_account_id);
+        for (cid, net) in snapshot {
+            if *net != 0 {
+                sp.insert((self.source_account_id, cid.clone()), *net);
+            }
         }
     }
 
@@ -112,12 +141,11 @@ impl Copier {
             .unwrap_or(&0)
     }
 
-    async fn sync_followers_to_leader(&self, contract_id: &str) {
-        // Read leader net from cache
+    pub async fn sync_dest_to_source_for_contract(&self, contract_id: &str) {
         let src_key = (self.source_account_id, contract_id.to_string());
         let src_net = match self.src_pos.read().await.get(&src_key) {
             None => 0,
-            Some(v) => *v,
+            Some(net) => *net,
         };
 
         for &dest in &self.dest_account_ids {
@@ -125,10 +153,11 @@ impl Copier {
             let diff = src_net - dest_net;
             if diff == 0 { continue; }
 
-            let side = if diff > 0 { 0 } else { 1 };
-            let size = diff.abs();
-
-            let tag = unique_sync_tag(contract_id, dest, diff);
+            let step = diff.clamp(-self.max_resync_step, self.max_resync_step);
+            if step == 0 { continue; }
+            let side = if step > 0 { 0 } else { 1 };
+            let size = step.abs();
+            let tag = unique_sync_tag(contract_id, dest, step);
 
             let req = PlaceOrderReq {
                 account_id: dest,
@@ -145,8 +174,11 @@ impl Copier {
 
             match self.dest.place_order(&req).await {
                 Ok(resp) => {
-                    info!("Sync {}: adjusted follower {} by {} -> order {}", contract_id, dest, diff, resp.order_id);
-                    // Update follower cache to leader value
+                    info!(
+                        "Sync {}: adjusted dest {} by {} (leader net {}) via order {}",
+                        contract_id, dest, step, src_net, resp.order_id
+                    );
+                    // set follower cache to leader net after our order
                     let mut dp = self.dest_pos.write().await;
                     if src_net == 0 {
                         dp.remove(&(dest, contract_id.to_string()));
@@ -155,31 +187,30 @@ impl Copier {
                     }
                 }
                 Err(e) => {
-                    warn!("Sync {}: place_order follower {} diff {} failed: {}", contract_id, dest, diff, e);
+                    warn!("Sync {}: failed to adjust dest {} by {}: {}", contract_id, dest, step, e);
                 }
             }
         }
     }
 
-    async fn flatten_followers_if_leader_flat(&self, contract_id: &str) {
+    pub async fn flatten_dest_if_needed(&self, contract_id: &str) {
         let src_key = (self.source_account_id, contract_id.to_string());
-        let leader_flat = { !self.src_pos.read().await.contains_key(&src_key) };
-        if !leader_flat { return; }
+        let src_flat = { !self.src_pos.read().await.contains_key(&src_key) };
+        if !src_flat { return; }
 
-        // For each follower with non-zero pos, place opposing market order
         let mut to_flatten: Vec<(i32, i32)> = Vec::new();
         {
-            let dp = self.dest_pos.read().await;
+            let dest_map = self.dest_pos.read().await;
             for &dest in &self.dest_account_ids {
                 let key = (dest, contract_id.to_string());
-                if let Some(&pos) = dp.get(&key) {
+                if let Some(&pos) = dest_map.get(&key) {
                     if pos != 0 { to_flatten.push((dest, pos)); }
                 }
             }
         }
 
         for (dest, pos) in to_flatten {
-            let side = if pos > 0 { 1 } else { 0 };
+            let side = if pos > 0 { 1 } else { 0 }; // if long, sell; if short, buy
             let size = pos.abs();
             let tag = format!("TCX:FLATTEN:{}:{}", contract_id, dest);
             let req = PlaceOrderReq {
@@ -196,83 +227,102 @@ impl Copier {
             };
             match self.dest.place_order(&req).await {
                 Ok(resp) => {
-                    info!("Flatten follower {} on {} (pos {}) via order {}", dest, contract_id, pos, resp.order_id);
-                    let mut dp = self.dest_pos.write().await;
-                    dp.remove(&(dest, contract_id.to_string()));
+                    info!("Flattened acct {} on {} with order {} (pos was {})", dest, contract_id, resp.order_id, pos);
+                    let mut dest_map = self.dest_pos.write().await;
+                    dest_map.remove(&(dest, contract_id.to_string()));
                 }
-                Err(e) => error!("Flatten follower {} on {} failed: {}", dest, contract_id, e),
+                Err(e) => error!("Failed to flatten acct {} on {}: {}", dest, contract_id, e),
             }
         }
     }
 
-    // ===== Main loop: RTC-only, no REST polling =====
-    pub async fn run(&self) -> anyhow::Result<()> {
-        info!("TradeCopierX starting");
-        self.reconcile_once().await;
+    /// REST-only loop:
+    /// - Poll leader open positions every `source_poll_ms`
+    /// - Compute deltas vs last snapshot
+    /// - Sync followers to leader net using market orders
+    /// - (Optional) follower drift check is available but disabled by default
+    pub async fn run_rest_only(&self) -> Result<()> {
+        info!("TradeCopierX starting (REST-only mode). Polling leader positions every {} ms", self.source_poll_ms);
 
-        // From here on, **no more REST searches**:
-        set_live_mode_live();
-
-        // Start RTC
-        let mut rx = start_userhub(
-            self.src.clone(),
-            self.source_account_id,
-            self.dest_account_ids.clone(),
-        ).await?;
-
-        loop {
-            tokio::select! {
-                maybe_evt = rx.recv() => {
-                    match maybe_evt {
-                        Some(RtcEvent::Trade(tr)) => {
-                            // De-dup source trades
-                            {
-                                let mut seen = self.seen.write().await;
-                                if !seen.insert(tr.id) { continue; }
-                            }
-                            // Update source position cache
-                            let key = (self.source_account_id, tr.contract_id.clone());
-                            let mut sp = self.src_pos.write().await;
-                            let prev = *sp.get(&key).unwrap_or(&0);
-                            let next = prev + Self::side_to_delta(tr.side, tr.size);
-                            if next == 0 { sp.remove(&key); } else { sp.insert(key, next); }
-                            drop(sp);
-
-                            // Converge followers
-                            self.sync_followers_to_leader(&tr.contract_id).await;
-                            self.flatten_followers_if_leader_flat(&tr.contract_id).await;
-                            self.sync_followers_to_leader(&tr.contract_id).await;
-                        }
-                        Some(RtcEvent::SrcPosition { contract_id, signed_net }) => {
-                            let mut sp = self.src_pos.write().await;
-                            let key = (self.source_account_id, contract_id.clone());
-                            if signed_net == 0 { sp.remove(&key); } else { sp.insert(key, signed_net); }
-                            drop(sp);
-                            self.sync_followers_to_leader(&contract_id).await;
-                            self.flatten_followers_if_leader_flat(&contract_id).await;
-                            self.sync_followers_to_leader(&contract_id).await;
-                        }
-                        Some(RtcEvent::DestPosition { account_id, contract_id, signed_net }) => {
-                            if self.dest_account_ids.iter().any(|&d| d == account_id) {
-                                let mut dp = self.dest_pos.write().await;
-                                if signed_net == 0 {
-                                    dp.remove(&(account_id, contract_id.clone()));
-                                } else {
-                                    dp.insert((account_id, contract_id.clone()), signed_net);
-                                }
-                            }
-                        }
-                        None => {
-                            warn!("RTC channel closed; recreating");
-                            rx = start_userhub(
-                                self.src.clone(),
-                                self.source_account_id,
-                                self.dest_account_ids.clone(),
-                            ).await?;
-                        }
-                    }
+        // Initial last snapshot equals startup cache
+        let mut last_snapshot: AHashMap<String, i32> = {
+            let mut map = AHashMap::new();
+            let sp = self.src_pos.read().await;
+            for ((acc, cid), net) in sp.iter() {
+                if *acc == self.source_account_id {
+                    map.insert(cid.clone(), *net);
                 }
             }
+            map
+        };
+
+        // Optional follower drift checker (OFF by default)
+        if self.enable_follower_drift_check {
+            let dest_client = self.dest.clone();
+            let dest_ids = self.dest_account_ids.clone();
+            let dest_pos = self.dest_pos.clone();
+            tokio::spawn(async move {
+                loop {
+                    for &dest in &dest_ids {
+                        match dest_client.search_open_positions(dest).await {
+                            Ok(res) => {
+                                let mut dp = dest_pos.write().await;
+                                dp.retain(|(acc, _), _| *acc != dest);
+                                for p in res.positions {
+                                    let net = match p.r#type { 1 => p.size, 2 => -p.size, _ => 0 };
+                                    if net != 0 {
+                                        dp.insert((dest, p.contract_id.clone()), net);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Follower drift check (dest {}): {}", dest, e);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            });
+        }
+
+        loop {
+            // 1) Poll leader positions
+            match self.src.search_open_positions(self.source_account_id).await {
+                Ok(res) => {
+                    // Build current snapshot map<contractId, signedNet>
+                    let mut current: AHashMap<String, i32> = AHashMap::new();
+                    for p in res.positions {
+                        let net = Self::signed_net_from_record(&p);
+                        if net != 0 {
+                            current.insert(p.contract_id.clone(), net);
+                        }
+                    }
+
+                    // Update in-memory src cache to current snapshot
+                    let snapshot_vec: Vec<(String, i32)> = current.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                    self.set_src_snapshot(&snapshot_vec).await;
+
+                    // 2) For each observed contract, sync followers
+                    //    (Union of old+current keys handles both opens and closes)
+                    let mut union: HashSet<String> = HashSet::new();
+                    for k in current.keys() { union.insert(k.clone()); }
+                    for k in last_snapshot.keys() { union.insert(k.clone()); }
+
+                    for cid in union {
+                        self.sync_dest_to_source_for_contract(&cid).await;
+                        self.flatten_dest_if_needed(&cid).await;
+                    }
+
+                    // 3) Save current as last
+                    last_snapshot = current;
+                }
+                Err(e) => {
+                    warn!("Leader poll failed: {}", e);
+                }
+            }
+
+            // 4) Sleep to respect rate budget (default 1500 ms)
+            tokio::time::sleep(std::time::Duration::from_millis(self.source_poll_ms)).await;
         }
     }
 }

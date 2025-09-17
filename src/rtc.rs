@@ -1,25 +1,22 @@
-use crate::models::TradeRecord;
 use crate::client::PxClient;
+use crate::models::TradeRecord;
+use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub enum RtcEvent {
     Trade(TradeRecord),
     SrcPosition { contract_id: String, signed_net: i32 },
-    DestPosition { account_id: i32, contract_id: String, signed_net: i32 },
 }
 
-fn default_rtc_base() -> String {
-    std::env::var("PX_RTC_BASE").unwrap_or_else(|_| "https://rtc.topstepx.com".to_string())
-}
-
-fn user_hub_url(token: &str) -> String {
-    let base = default_rtc_base();
-    let url = base.trim_end_matches('/');
+// Only USER HUB. No market hub anywhere.
+fn user_hub_url(rtc_base: &str, token: &str) -> String {
+    let url = rtc_base.trim_end_matches('/');
     let wss = url.replace("http://", "ws://").replace("https://", "wss://");
     let enc_tok = urlencoding::encode(token);
     format!("{}/hubs/user?access_token={}", wss, enc_tok)
@@ -43,9 +40,9 @@ fn frame_json(v: &serde_json::Value) -> Message {
 
 pub async fn start_userhub(
     src: Arc<PxClient>,
+    rtc_base: String,
     source_account_id: i32,
-    dest_account_ids: Vec<i32>,
-) -> anyhow::Result<mpsc::Receiver<RtcEvent>> {
+) -> Result<mpsc::Receiver<RtcEvent>> {
     let (tx, rx) = mpsc::channel::<RtcEvent>(2048);
 
     tokio::spawn(async move {
@@ -60,41 +57,38 @@ pub async fn start_userhub(
             let token = match src.bearer().await {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!("RTC: failed to get bearer token: {}", e);
+                    warn!("RTC: failed to get bearer token: {}", e);
                     sleep(Duration::from_millis(1000)).await;
                     continue;
                 }
             };
 
-            // 2) connect
-            let url = user_hub_url(&token);
-            tracing::info!("RTC: connecting to {}", url);
+            // 2) connect to USER HUB only
+            let url = user_hub_url(&rtc_base, &token);
+            info!("RTC: connecting to {}", url);
 
             match tokio_tungstenite::connect_async(url).await {
                 Ok((mut ws, _resp)) => {
-                    tracing::info!("RTC: connected");
+                    info!("RTC: connected");
                     attempt = 0;
 
                     // 3) handshake
                     let hs = serde_json::json!({ "protocol": "json", "version": 1 });
                     if ws.send(frame_json(&hs)).await.is_err() {
-                        tracing::warn!("RTC: failed to send handshake; reconnecting");
+                        warn!("RTC: failed to send handshake; reconnecting");
                         continue;
                     }
 
-                    // 4) subscribe: source full, dest positions
-                    let mut subs = vec![
+                    // 4) subscribe: source only
+                    let subs = vec![
                         serde_json::json!({"type":1, "target":"SubscribeAccounts", "arguments": []}),
                         serde_json::json!({"type":1, "target":"SubscribeOrders",   "arguments": [source_account_id]}),
                         serde_json::json!({"type":1, "target":"SubscribePositions","arguments": [source_account_id]}),
                         serde_json::json!({"type":1, "target":"SubscribeTrades",   "arguments": [source_account_id]}),
                     ];
-                    for id in &dest_account_ids {
-                        subs.push(serde_json::json!({"type":1, "target":"SubscribePositions","arguments":[id]}));
-                    }
                     for m in subs {
                         if let Err(e) = ws.send(frame_json(&m)).await {
-                            tracing::warn!("RTC: failed to send subscribe: {}", e);
+                            warn!("RTC: failed to send subscribe: {}", e);
                             continue;
                         }
                     }
@@ -126,16 +120,12 @@ pub async fn start_userhub(
                                                         && let Some(pt)  = first.get("type").and_then(|v| v.as_i64())  // 1=Long 2=Short
                                                         && let Some(sz)  = first.get("size").and_then(|v| v.as_i64())
                                                     {
-                                                        let signed = match pt {
-                                                            1 =>  sz as i32,
-                                                            2 => -(sz as i32),
-                                                            _ => 0
-                                                        };
-                                                        let acc_i32 = acc as i32;
-                                                        if acc_i32 == source_account_id {
-                                                            let _ = tx.send(RtcEvent::SrcPosition { contract_id: cid.to_string(), signed_net: signed }).await;
-                                                        } else if dest_account_ids.iter().any(|&d| d == acc_i32) {
-                                                            let _ = tx.send(RtcEvent::DestPosition { account_id: acc_i32, contract_id: cid.to_string(), signed_net: signed }).await;
+                                                        if acc as i32 == source_account_id {
+                                                            let signed = match pt { 1 =>  sz as i32, 2 => -(sz as i32), _ => 0 };
+                                                            let _ = tx.send(RtcEvent::SrcPosition {
+                                                                contract_id: cid.to_string(),
+                                                                signed_net: signed
+                                                            }).await;
                                                         }
                                                     }
                                                 }
@@ -148,21 +138,21 @@ pub async fn start_userhub(
                                 }
                             }
                             Ok(Message::Close(_)) => {
-                                tracing::warn!("RTC: server closed connection");
+                                warn!("RTC: server closed connection");
                                 break;
                             }
                             Err(e) => {
-                                tracing::warn!("RTC websocket error: {}", e);
+                                warn!("RTC websocket error: {}", e);
                                 break;
                             }
                             _ => {}
                         }
                     }
 
-                    tracing::info!("RTC: disconnected, will reconnect");
+                    info!("RTC: disconnected, will reconnect");
                 }
                 Err(e) => {
-                    tracing::warn!("RTC: connect failed: {}", e);
+                    warn!("RTC: connect failed: {}", e);
                 }
             }
 

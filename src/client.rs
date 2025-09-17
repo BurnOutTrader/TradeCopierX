@@ -1,11 +1,24 @@
 use crate::models::*;
 use anyhow::anyhow;
+use once_cell::sync::OnceCell;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use reqwest::{Client, StatusCode};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::sync::{atomic::{AtomicBool, Ordering}, OnceLock};
-use tokio::sync::{RwLock, Semaphore};
+use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::Instrument;
+
+static REST_LIMITER: OnceCell<Arc<Semaphore>> = OnceCell::new();
+
+fn rest_limiter() -> Arc<Semaphore> {
+    REST_LIMITER.get_or_init(|| {
+        let permits = std::env::var("PX_REST_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        Arc::new(Semaphore::new(permits.max(1)))
+    }).clone()
+}
 
 pub struct PxClient {
     pub api_base: String,
@@ -14,36 +27,24 @@ pub struct PxClient {
     pub token: RwLock<Option<String>>,
 }
 
-// ===== Live mode + REST limiter =====
-static LIVE_MODE: AtomicBool = AtomicBool::new(false);
-static REST_LIMITER: OnceLock<Semaphore> = OnceLock::new();
-
-fn rest_limiter() -> &'static Semaphore {
-    REST_LIMITER.get_or_init(|| {
-        let permits = std::env::var("PX_REST_CONCURRENCY")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-        Semaphore::new(permits.max(1))
-    })
-}
-
-/// Call once, right after startup reconcile completes.
-/// Blocks any search endpoints thereafter.
-pub fn set_live_mode_live() {
-    LIVE_MODE.store(true, Ordering::Relaxed);
-}
-
 impl PxClient {
     pub fn new(api_base: String, auth: AuthMode) -> Self {
         let http = Client::builder()
-            .user_agent("TradeCopierX/0.1")
+            .user_agent("TradeCopierX/0.3")
             .build()
             .unwrap();
         Self { api_base, auth, http, token: RwLock::new(None) }
     }
 
     fn backoff_cfg() -> (u64, u32) {
-        let base = std::env::var("PX_HTTP_BACKOFF_BASE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(250u64);
-        let maxr = std::env::var("PX_HTTP_MAX_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(5u32);
+        let base = std::env::var("PX_HTTP_BACKOFF_BASE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(250u64);
+        let maxr = std::env::var("PX_HTTP_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5u32);
         (base, maxr)
     }
 
@@ -65,33 +66,37 @@ impl PxClient {
             AuthMode::ApiKey { username, api_key } => (username, api_key),
         };
         let url = format!("{}/api/Auth/loginKey", self.api_base);
-        let body = LoginKeyReq { user_name: username, api_key };
+        let body = serde_json::json!({ "userName": username, "apiKey": api_key });
         let resp = self.http.post(url).json(&body).send().await?;
-        if resp.status() != StatusCode::OK { return Err(anyhow!("loginKey http status {}", resp.status())); }
-        let env: ApiEnvelope<LoginKeyRes> = resp.json().await?;
-        let token = env.token.ok_or_else(|| anyhow!("missing token in loginKey response"))?;
+        if resp.status() != StatusCode::OK {
+            return Err(anyhow!("loginKey http status {}", resp.status()));
+        }
+        let env: ApiEnvelope<serde_json::Value> = resp.json().await?;
+        let token = env
+            .token
+            .ok_or_else(|| anyhow!("missing token in loginKey response"))?;
         *self.token.write().await = Some(token.clone());
         Ok(token)
     }
 
     pub async fn bearer(&self) -> anyhow::Result<String> {
-        if let Some(tok) = self.token.read().await.clone() { return Ok(tok); }
+        if let Some(tok) = self.token.read().await.clone() {
+            return Ok(tok);
+        }
         self.login().await
     }
 
-    pub async fn authed_post<T: DeserializeOwned, B: Serialize + ?Sized>(&self, path: &str, body: &B) -> anyhow::Result<T> {
-        // After live-mode, forbid search/polling endpoints
-        if LIVE_MODE.load(Ordering::Relaxed) && matches!(path,
-            "/api/Trade/search" |
-            "/api/Position/searchOpen" |
-            "/api/Account/search" |
-            "/api/History/retrieveBars" // keep history guarded too
-        ) {
-            return Err(anyhow!("Forbidden REST after LIVE mode: {}", path));
-        }
+    async fn take_permit() -> OwnedSemaphorePermit {
+        rest_limiter().clone().acquire_owned().await.unwrap()
+    }
 
-        // Serialize REST calls to reduce 429 bursts
-        let _permit = rest_limiter().acquire().await.unwrap();
+    pub async fn authed_post<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> anyhow::Result<T> {
+        // Serialize REST calls to reduce 429 bursts.
+        let _permit = Self::take_permit().await;
 
         let (base_ms, max_retries) = Self::backoff_cfg();
         let mut attempts: u32 = 0;
@@ -100,7 +105,9 @@ impl PxClient {
             let token = self.bearer().await?;
             let url = format!("{}{}", self.api_base, path);
             let span = tracing::info_span!("authed_post", %path, attempt = attempts);
-            let resp = self.http.post(url)
+            let resp = self
+                .http
+                .post(url)
                 .bearer_auth(&token)
                 .json(body)
                 .send()
@@ -115,26 +122,40 @@ impl PxClient {
             }
 
             if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                let retry_after_ms = resp.headers()
+                let retry_after_ms = resp
+                    .headers()
                     .get("retry-after")
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.trim().parse::<u64>().ok())
                     .map(|sec| sec * 1000);
 
-                // For non-critical endpoints, bail fast to avoid hammering
-                let is_critical = matches!(path, "/api/Order/place" | "/api/Position/closeContract");
+                // Retry critical endpoints more; others return error faster
+                let is_critical = matches!(path, "/api/Order/place" | "/api/Position/closeContract" | "/api/Position/searchOpen" | "/api/Account/search");
                 if !is_critical {
                     let txt = resp.text().await.unwrap_or_default();
                     return Err(anyhow!("HTTP {} on {} — {}", status, path, txt));
                 }
 
                 if attempts <= max_retries {
-                    tracing::warn!("HTTP {} on {} — backing off (attempt {}/{}, base={}ms)", status.as_u16(), path, attempts, max_retries, base_ms);
+                    tracing::warn!(
+                        "HTTP {} on {} — backing off (attempt {}/{}, base={}ms)",
+                        status.as_u16(),
+                        path,
+                        attempts,
+                        max_retries,
+                        base_ms
+                    );
                     Self::sleep_backoff(attempts, retry_after_ms).await;
                     continue;
                 }
                 let body_txt = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("POST {} failed after {} attempts: {} — {}", path, attempts, status, body_txt));
+                return Err(anyhow!(
+                    "POST {} failed after {} attempts: {} — {}",
+                    path,
+                    attempts,
+                    status,
+                    body_txt
+                ));
             }
 
             if !status.is_success() {
@@ -150,19 +171,18 @@ impl PxClient {
         }
     }
 
-    // ====== Convenience wrappers ======
+    // ===== Allowed operations =====
     pub async fn place_order(&self, req: &PlaceOrderReq<'_>) -> anyhow::Result<PlaceOrderRes> {
         self.authed_post("/api/Order/place", req).await
     }
 
     pub async fn close_contract(&self, account_id: i32, contract_id: &str) -> anyhow::Result<()> {
         let req = CloseContractReq { account_id, contract_id };
-        // ignore envelope payload, we only care about success/failure
         let _void: serde_json::Value = self.authed_post("/api/Position/closeContract", &req).await?;
         Ok(())
     }
 
-    // ====== Startup-only calls (MUST be called before set_live_mode_live) ======
+    // ===== Polling calls =====
     pub async fn search_accounts(&self, only_active: Option<bool>) -> anyhow::Result<AccountSearchRes> {
         let req = AccountSearchReq { only_active_accounts: only_active };
         self.authed_post("/api/Account/search", &req).await
@@ -173,14 +193,3 @@ impl PxClient {
         self.authed_post("/api/Position/searchOpen", &req).await
     }
 }
-
-// ===== helper for login payload =====
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LoginKeyReq<'a> {
-    #[serde(rename = "userName")] pub user_name: &'a str,
-    #[serde(rename = "apiKey")] pub api_key: &'a str,
-}
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LoginKeyRes {}
