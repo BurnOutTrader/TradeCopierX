@@ -8,6 +8,7 @@ mod models;
 mod config;
 mod copier;
 mod client;
+mod rtc;
 
 use anyhow::{anyhow, Context, Result};
 use std::{env, fs, sync::Arc};

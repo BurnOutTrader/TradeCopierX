@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-use chrono::Utc;
 use tokio::time::sleep;
 use crate::client::PxClient;
-use crate::models::{PlaceOrderReq, TradeSearchReq};
+use crate::models::PlaceOrderReq;
+use crate::rtc::{self, RtcEvent};
 use ahash::AHashMap;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,31 +125,13 @@ impl Copier {
         (prev, next)
     }
 
-    async fn update_dest_position(&self, dest_acct: i32, contract_id: &str, side: i32, size: i32) -> i32 {
-        let key = (dest_acct, contract_id.to_string());
-        let mut map = self.dest_pos.write().await;
-        let prev = *map.get(&key).unwrap_or(&0);
-        let next = prev + Self::side_to_delta(side, size);
-        if next == 0 { map.remove(&key); } else { map.insert(key, next); }
-        next
-    }
     async fn get_live_dest_net(&self, dest: i32, contract_id: &str) -> i32 {
-        match self.dest.search_open_positions(dest).await {
-            Ok(res) => {
-                let mut net = 0;
-                for p in res.positions {
-                    if p.contract_id == contract_id {
-                        net += if p.r#type == 0 { p.size } else { -p.size };
-                    }
-                }
-                net
-            }
-            Err(_) => {
-                *self.dest_pos.read().await
-                    .get(&(dest, contract_id.to_string()))
-                    .unwrap_or(&0)
-            }
-        }
+        // Stop hitting REST for follower position. Rely on in-memory cache which is
+        // updated on our own order placements and during startup reconcile.
+        // This avoids continuous POST /api/Position/searchOpen calls.
+        *self.dest_pos.read().await
+            .get(&(dest, contract_id.to_string()))
+            .unwrap_or(&0)
     }
 
     async fn sync_dest_to_source_for_contract_live(&self, contract_id: &str) {
@@ -266,90 +248,51 @@ impl Copier {
     }
 
     pub(crate) async fn run(&self) -> anyhow::Result<()> {
-        info!("TradeCopierX starting");
+        info!("TradeCopierX starting (RTC mode)");
         // A) Flatten stragglers first (don’t replay history)
         self.reconcile_on_startup().await;
 
-        // B) Only consume trades from now onwards
-        let mut since_rfc3339: Option<String> = Some(Utc::now().to_rfc3339());
+        // B) Start real-time subscription to user hub for trades
+        let mut rx = rtc::start_userhub(self.src.clone(), self.source_account_id).await?;
 
         let mut last_sync = std::time::Instant::now();
 
         loop {
-            // 1) Poll source trades
-            let req = TradeSearchReq {
-                account_id: self.source_account_id,
-                start_timestamp: since_rfc3339.as_deref(),
-                end_timestamp: None,
-            };
-            match self.src.search_trades(&req).await {
-                Ok(res) => {
-                    for tr in res.trades {
-                        // avoid duplicates
-                        let mut seen = self.seen.write().await;
-                        if !seen.insert(tr.id) { continue; }
-                        drop(seen);
-
-                        // Update source net position and, if now flat on this contract, trigger follower flattening
-                        let (_prev_src, _next_src) = self.update_src_position(&tr.contract_id, tr.side, tr.size).await;
-
-                        // 2) Mirror to destination accounts
-                        for &dest in &self.dest_account_ids {
-                            if dest == tr.account_id { continue; }
-                            let tag = format!("TCX:{}:{}", tr.id, dest); // unique per dest
-                            let place = PlaceOrderReq {
-                                account_id: dest,
-                                contract_id: &tr.contract_id,
-                                r#type: 2, // market (simple MVP)
-                                side: tr.side,
-                                size: tr.size,
-                                limit_price: None,
-                                stop_price: None,
-                                trail_price: None,
-                                custom_tag: Some(tag),
-                                linked_order_id: None,
-                            };
-                            match self.dest.place_order(&place).await {
-                                Ok(resp) => {
-                                    info!("Mirrored trade {} to acct {} as order {}", tr.id, dest, resp.order_id);
-                                    // Track dest running position
-                                    let _ = self.update_dest_position(dest, &tr.contract_id, tr.side, tr.size).await;
-                                },
-                                Err(e) => error!("Failed to mirror trade {} to acct {}: {}", tr.id, dest, e),
-                            }
+            tokio::select! {
+                maybe_evt = rx.recv() => {
+                    match maybe_evt {
+                        Some(RtcEvent::Trade(tr)) => {
+                            // avoid duplicates
+                            let mut seen = self.seen.write().await;
+                            if !seen.insert(tr.id) { continue; }
+                            drop(seen);
+                            // Update leader net cache
+                            let _ = self.update_src_position(&tr.contract_id, tr.side, tr.size).await;
+                            // Sync followers to leader net
+                            self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
+                            // If leader became flat on this contract, ensure followers are flat
+                            self.flatten_dest_if_needed(&tr.contract_id).await;
+                            // One more pass to tighten
+                            self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
                         }
-
-                        // If the leader is flat on this contract, ensure followers are flat too
-                        self.flatten_dest_if_needed(&tr.contract_id).await;
-
-                        // Keep followers exactly matched to leader net for this contract
-                        self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
-
-                        // advance watermark
-                        since_rfc3339 = Some(tr.creation_timestamp.clone());
+                        None => {
+                            // channel closed; wait a bit and try to restart the RTC
+                            warn!("RTC channel closed; attempting to restart");
+                            rx = rtc::start_userhub(self.src.clone(), self.source_account_id).await?;
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!("trade search error: {}", e);
+                _ = sleep(Duration::from_millis(self.poll_interval_ms)) => {
+                    // periodic convergence and housekeeping
+                    if last_sync.elapsed() >= Duration::from_millis(self.sync_interval_ms) {
+                        let mut all_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        { let sp = self.src_pos.read().await; for (_k, _v) in sp.iter() { all_contracts.insert(_k.1.clone()); } }
+                        { let dp = self.dest_pos.read().await; for (_k, _v) in dp.iter() { all_contracts.insert(_k.1.clone()); } }
+                        for cid in all_contracts.iter() { self.sync_dest_to_source_for_contract_live(cid).await; }
+                        last_sync = std::time::Instant::now();
+                    }
                 }
             }
-
-            if last_sync.elapsed() >= Duration::from_millis(self.sync_interval_ms) {
-                // Build a set of all contracts we have seen either on leader or followers
-                let mut all_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
-                {
-                    let sp = self.src_pos.read().await; for (_k, _v) in sp.iter() { all_contracts.insert(_k.1.clone()); }
-                }
-                {
-                    let dp = self.dest_pos.read().await; for (_k, _v) in dp.iter() { all_contracts.insert(_k.1.clone()); }
-                }
-                for cid in all_contracts.iter() {
-                    self.sync_dest_to_source_for_contract_live(cid).await;
-                }
-                last_sync = std::time::Instant::now();
-            }
-
-            sleep(Duration::from_millis(self.poll_interval_ms)).await;
         }
     }
 }

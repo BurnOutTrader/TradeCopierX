@@ -30,16 +30,6 @@ pub(crate) struct LoginKeyReq<'a> {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct LoginKeyRes {}
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TradeSearchReq<'a> {
-    pub account_id: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_timestamp: Option<&'a str>, // RFC3339
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_timestamp: Option<&'a str>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(unused)]
@@ -57,12 +47,6 @@ pub struct TradeRecord {
     pub size: i32,
     pub voided: bool,
     pub order_id: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TradeSearchRes {
-    pub trades: Vec<TradeRecord>
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -14,3 +14,7 @@ chrono = { version = "0.4.42", default-features = false, features = ["clock","st
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
 dotenvy = "0.15.7"
 ahash = "0.8.12"
+rand = { version = "0.8.5", default-features = false, features = ["std", "small_rng"] }
+futures-util = "0.3.31"
+tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-webpki-roots"] }
+urlencoding = "2.1.3"

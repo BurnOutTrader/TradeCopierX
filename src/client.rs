@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use reqwest::header::ACCEPT;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::models::{AccountSearchReq, AccountSearchRes, ApiEnvelope, AuthMode, CloseContractReq, LoginKeyReq, LoginKeyRes, PositionSearchOpenReq, PositionSearchOpenRes, TradeSearchReq, TradeSearchRes};
+use crate::models::{AccountSearchReq, AccountSearchRes, ApiEnvelope, AuthMode, CloseContractReq, LoginKeyReq, LoginKeyRes, PositionSearchOpenReq, PositionSearchOpenRes};
 // =============== API Client =================
 pub struct PxClient {
     pub api_base: String,
@@ -17,6 +17,27 @@ impl PxClient {
     pub fn new(api_base: String, auth: AuthMode) -> Self {
         let http = Client::builder().build().unwrap();
         Self { api_base, auth, http, token: RwLock::new(None) }
+    }
+
+    fn backoff_cfg() -> (u64, u32) {
+        // base_ms, max_retries
+        let base = std::env::var("PX_HTTP_BACKOFF_BASE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(250u64);
+        let maxr = std::env::var("PX_HTTP_MAX_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(6u32);
+        (base, maxr)
+    }
+
+    async fn sleep_backoff(attempts: u32, retry_after_ms: Option<u64>) {
+        use rand::{rngs::SmallRng, Rng, SeedableRng};
+        use tokio::time::{sleep, Duration};
+        // Prefer server instruction
+        let dur_ms = if let Some(ms) = retry_after_ms { ms } else {
+            let (base, _) = Self::backoff_cfg();
+            let exp = base.saturating_mul(1u64 << (attempts.saturating_sub(1).min(10)));
+            // jitter 0..base
+            let mut rng = SmallRng::from_entropy();
+            exp + rng.gen_range(0..=base)
+        };
+        sleep(Duration::from_millis(dur_ms.min(10_000))).await;
     }
 
     pub async fn login(&self) -> anyhow::Result<String> {
@@ -39,7 +60,8 @@ impl PxClient {
     }
 
     pub async fn authed_post<T: for<'de> Deserialize<'de>, B: Serialize + ?Sized>(&self, path: &str, body: &B) -> anyhow::Result<T> {
-        let mut attempts = 0;
+        let (_, max_retries) = Self::backoff_cfg();
+        let mut attempts: u32 = 0;
         loop {
             attempts += 1;
             let token = self.bearer().await?;
@@ -49,27 +71,39 @@ impl PxClient {
                 .json(body)
                 .send().await?;
 
-            if resp.status() == StatusCode::UNAUTHORIZED && attempts < 2 {
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED && attempts < 2 {
                 // refresh token once
                 self.login().await?;
                 continue;
             }
-            if !resp.status().is_success() {
-                let status = resp.status();
+
+            if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                // Respect Retry-After header if present
+                let retry_after_ms = resp.headers().get("retry-after").and_then(|h| h.to_str().ok()).and_then(|s| {
+                    // numeric seconds only
+                    if let Ok(sec) = s.trim().parse::<u64>() { Some(sec * 1000) } else { None }
+                });
+                if attempts <= max_retries { 
+                    tracing::warn!("HTTP {} on {} — backing off (attempt {}/{})", status.as_u16(), path, attempts, max_retries);
+                    Self::sleep_backoff(attempts, retry_after_ms).await;
+                    continue;
+                }
+                let body_txt = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("POST {} failed after {} attempts: {} — {}", path, attempts, status, body_txt));
+            }
+
+            if !status.is_success() {
                 let txt = resp.text().await.unwrap_or_default();
                 return Err(anyhow!("POST {} failed: {} — {}", path, status, txt));
             }
+
             let env: ApiEnvelope<T> = resp.json().await?;
             if !env.success && env.error_code != 0 {
                 return Err(anyhow!("API error {}: {:?}", env.error_code, env.error_message));
             }
             return Ok(env.data);
         }
-    }
-
-    // Trades
-    pub async fn search_trades(&self, req: &TradeSearchReq<'_>) -> anyhow::Result<TradeSearchRes> {
-        self.authed_post("/api/Trade/search", req).await
     }
 
     // Orders
@@ -84,7 +118,6 @@ impl PxClient {
             attempts += 1;
             let token = self.bearer().await?;
             let url = format!("{}{}", self.api_base, path);
-
             let resp = self.http
                 .post(url)
                 .bearer_auth(&token)
@@ -93,12 +126,26 @@ impl PxClient {
                 .send()
                 .await?;
 
-            if resp.status() == StatusCode::UNAUTHORIZED && attempts < 2 {
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED && attempts < 2 {
                 self.login().await?;
                 continue;
             }
 
-            let status = resp.status();
+            if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                let retry_after_ms = resp.headers().get("retry-after").and_then(|h| h.to_str().ok()).and_then(|s| {
+                    if let Ok(sec) = s.trim().parse::<u64>() { Some(sec * 1000) } else { None }
+                });
+                let (_, max_retries) = Self::backoff_cfg();
+                if attempts <= max_retries {
+                    tracing::warn!("place_order: HTTP {} — backing off (attempt {}/{})", status.as_u16(), attempts, max_retries);
+                    Self::sleep_backoff(attempts, retry_after_ms).await;
+                    continue;
+                }
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("place_order failed after {} attempts: HTTP {} — {}", attempts, status, body));
+            }
+
             let body = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 return Err(anyhow!("HTTP {} — {}", status, body));
@@ -159,12 +206,25 @@ impl PxClient {
             let token = self.bearer().await?;
             let url = format!("{}{}", self.api_base, "/api/Position/closeContract");
             let resp = self.http.post(url).bearer_auth(&token).json(&req).send().await?;
-            if resp.status() == StatusCode::UNAUTHORIZED && attempts < 2 {
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED && attempts < 2 {
                 self.login().await?;
                 continue;
             }
-            if !resp.status().is_success() {
-                let status = resp.status();
+            if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                let retry_after_ms = resp.headers().get("retry-after").and_then(|h| h.to_str().ok()).and_then(|s| {
+                    if let Ok(sec) = s.trim().parse::<u64>() { Some(sec * 1000) } else { None }
+                });
+                let (_, max_retries) = Self::backoff_cfg();
+                if attempts <= max_retries {
+                    tracing::warn!("close_contract: HTTP {} — backing off (attempt {}/{})", status.as_u16(), attempts, max_retries);
+                    Self::sleep_backoff(attempts, retry_after_ms).await;
+                    continue;
+                }
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("POST /api/Position/closeContract failed after {} attempts: {} — {}", attempts, status, txt));
+            }
+            if !status.is_success() {
                 let txt = resp.text().await.unwrap_or_default();
                 return Err(anyhow!("POST /api/Position/closeContract failed: {} — {}", status, txt));
             }
