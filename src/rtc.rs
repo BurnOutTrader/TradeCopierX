@@ -43,14 +43,25 @@ fn frame_json(v: &serde_json::Value) -> Message {
     Message::Text(s)
 }
 
-pub async fn start_userhub(src: Arc<PxClient>, source_account_id: i32) -> anyhow::Result<mpsc::Receiver<RtcEvent>> {
+pub async fn start_userhub(
+    src: Arc<PxClient>,
+    source_account_id: i32,
+    dest_account_ids: Vec<i32>,
+    dest_pos_tx: mpsc::Sender<(i32, String, i32)>, // (destId, contractId, signedNet)
+) -> anyhow::Result<mpsc::Receiver<RtcEvent>> {
     let (tx, rx) = mpsc::channel::<RtcEvent>(1024);
 
     tokio::spawn(async move {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::time::{sleep, Duration};
+        use tokio_tungstenite::tungstenite::Message;
+
         let mut attempt: u32 = 0;
+
         loop {
             attempt = attempt.saturating_add(1);
-            // get token (refresh if needed)
+
+            // 1) Bearer (refresh if needed)
             let token = match src.bearer().await {
                 Ok(t) => t,
                 Err(e) => {
@@ -59,63 +70,88 @@ pub async fn start_userhub(src: Arc<PxClient>, source_account_id: i32) -> anyhow
                     continue;
                 }
             };
+
+            // 2) Connect
             let url = user_hub_url(&token);
             tracing::info!("RTC: connecting to {}", url);
-            match connect_async(url).await {
+
+            match tokio_tungstenite::connect_async(url).await {
                 Ok((mut ws, _resp)) => {
                     tracing::info!("RTC: connected");
-                    // Reset attempt counter after successful connect
-                    attempt = 0;
+                    attempt = 0; // reset backoff
 
-                    // Handshake
-                    let hs = serde_json::json!({"protocol":"json","version":1});
-                    if ws.send(frame_json(&hs)).await.is_err() { continue; }
+                    // 3) Handshake
+                    let hs = serde_json::json!({ "protocol": "json", "version": 1 });
+                    if ws.send(frame_json(&hs)).await.is_err() {
+                        tracing::warn!("RTC: failed to send handshake; reconnecting");
+                        continue;
+                    }
 
-                    // Subscriptions
-                    let subs = vec![
+                    // 4) Subscriptions
+                    let mut subs = vec![
                         serde_json::json!({"type":1, "target":"SubscribeAccounts", "arguments": []}),
                         serde_json::json!({"type":1, "target":"SubscribeOrders",   "arguments": [source_account_id]}),
                         serde_json::json!({"type":1, "target":"SubscribePositions","arguments": [source_account_id]}),
                         serde_json::json!({"type":1, "target":"SubscribeTrades",   "arguments": [source_account_id]}),
                     ];
+                    for id in &dest_account_ids {
+                        subs.push(serde_json::json!({"type":1, "target":"SubscribePositions","arguments":[id]}));
+                    }
                     for m in subs {
-                        if let Err(e) = ws.send(frame_json(&m)).await { 
+                        if let Err(e) = ws.send(frame_json(&m)).await {
                             tracing::warn!("RTC: failed to send subscribe: {}", e);
-                            break; 
+                            continue;
                         }
                     }
 
-                    // Read loop
+                    // 5) Read loop
                     while let Some(msg) = ws.next().await {
                         match msg {
                             Ok(Message::Text(txt)) => {
                                 for part in txt.split('\u{001e}') {
                                     let p = part.trim();
                                     if p.is_empty() { continue; }
-                                    if let Ok(inv) = serde_json::from_str::<ServerInvocation>(p) {
-                                        if inv.r#type == 1 {
-                                            if let Some(tgt) = inv.target.as_deref() {
-                                                if tgt == "GatewayUserTrade" {
-                                                    if let Some(args) = inv.arguments.as_ref() {
-                                                        if let Some(first) = args.get(0) {
-                                                            if let Ok(tr) = serde_json::from_value::<TradeRecord>(first.clone()) {
-                                                                let _ = tx.send(RtcEvent::Trade(tr)).await;
-                                                            }
+
+                                    match serde_json::from_str::<ServerInvocation>(p) {
+                                        Ok(inv) if inv.r#type == 1 => {
+                                            match inv.target.as_deref() {
+                                                Some("GatewayUserTrade") => {
+                                                    if let Some(args) = inv.arguments.as_ref()
+                                                        && let Some(first) = args.get(0)
+                                                        && let Ok(tr) = serde_json::from_value::<TradeRecord>(first.clone())
+                                                    {
+                                                        let _ = tx.send(RtcEvent::Trade(tr)).await;
+                                                    }
+                                                }
+                                                Some("GatewayUserPosition") => {
+                                                    if let Some(args) = inv.arguments.as_ref()
+                                                        && let Some(first) = args.get(0)
+                                                        && let Some(acc) = first.get("accountId").and_then(|v| v.as_i64())
+                                                        && let Some(cid) = first.get("contractId").and_then(|v| v.as_str())
+                                                        && let Some(pt)  = first.get("type").and_then(|v| v.as_i64())
+                                                        && let Some(sz)  = first.get("size").and_then(|v| v.as_i64())
+                                                    {
+                                                        let acc_i32 = acc as i32;
+                                                        if dest_account_ids.iter().any(|&d| d == acc_i32) {
+                                                            let signed = match pt {
+                                                                1 =>  sz as i32,  // Long
+                                                                2 => -(sz as i32), // Short
+                                                                _ => 0,
+                                                            };
+                                                            let _ = dest_pos_tx.send((acc_i32, cid.to_string(), signed)).await;
                                                         }
                                                     }
                                                 }
+                                                _ => {}
                                             }
                                         }
-                                        // ignore other message types
-                                    } else {
-                                        tracing::debug!("RTC: non-invocation message: {}", p);
+                                        Ok(_) => {} // ignore other SignalR message types
+                                        Err(_) => {
+                                            tracing::debug!("RTC: unparsed frame: {}", p);
+                                        }
                                     }
                                 }
                             }
-                            Ok(Message::Binary(_)) => {}
-                            Ok(Message::Ping(_)) => {}
-                            Ok(Message::Pong(_)) => {}
-                            Ok(Message::Frame(_)) => {}
                             Ok(Message::Close(_)) => {
                                 tracing::warn!("RTC: server closed connection");
                                 break;
@@ -124,15 +160,18 @@ pub async fn start_userhub(src: Arc<PxClient>, source_account_id: i32) -> anyhow
                                 tracing::warn!("RTC websocket error: {}", e);
                                 break;
                             }
+                            _ => {}
                         }
                     }
+
                     tracing::info!("RTC: disconnected, will reconnect");
                 }
                 Err(e) => {
                     tracing::warn!("RTC: connect failed: {}", e);
                 }
             }
-            // backoff with cap
+
+            // 6) Exponential backoff (cap 10s)
             let backoff_ms = (500u64 * (1u64 << (attempt.min(6)))).min(10_000);
             sleep(Duration::from_millis(backoff_ms)).await;
         }

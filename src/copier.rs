@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use crate::client::PxClient;
 use crate::models::PlaceOrderReq;
-use crate::rtc::{self, RtcEvent};
+use crate::rtc::{self, start_userhub, RtcEvent};
 use ahash::AHashMap;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -249,50 +249,85 @@ impl Copier {
 
     pub(crate) async fn run(&self) -> anyhow::Result<()> {
         info!("TradeCopierX starting (RTC mode)");
-        // A) Flatten stragglers first (don’t replay history)
+        // One-off REST seed; after this we stay off REST in live mode
         self.reconcile_on_startup().await;
 
-        // B) Start real-time subscription to user hub for trades
-        let mut rx = rtc::start_userhub(self.src.clone(), self.source_account_id).await?;
+        // Channel for follower position updates coming from RTC (GatewayUserPosition)
+        let (mut dest_pos_tx, mut dest_pos_rx) = mpsc::channel::<(i32, String, i32)>(1024);
 
-        let mut last_sync = std::time::Instant::now();
+        // Start the RTC user hub (source + followers)
+        let mut trade_rx = start_userhub(
+            self.src.clone(),
+            self.source_account_id,
+            self.dest_account_ids.clone(),
+            dest_pos_tx.clone(),
+        ).await?;
+
+        let mut last_sync = Instant::now();
 
         loop {
             tokio::select! {
-                maybe_evt = rx.recv() => {
-                    match maybe_evt {
-                        Some(RtcEvent::Trade(tr)) => {
-                            // avoid duplicates
+            // ===== Source trades from RTC =====
+            maybe_evt = trade_rx.recv() => {
+                match maybe_evt {
+                    Some(RtcEvent::Trade(tr)) => {
+                        // De-dup trades
+                        {
                             let mut seen = self.seen.write().await;
                             if !seen.insert(tr.id) { continue; }
-                            drop(seen);
-                            // Update leader net cache
-                            let _ = self.update_src_position(&tr.contract_id, tr.side, tr.size).await;
-                            // Sync followers to leader net
-                            self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
-                            // If leader became flat on this contract, ensure followers are flat
-                            self.flatten_dest_if_needed(&tr.contract_id).await;
-                            // One more pass to tighten
-                            self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
                         }
-                        None => {
-                            // channel closed; wait a bit and try to restart the RTC
-                            warn!("RTC channel closed; attempting to restart");
-                            rx = rtc::start_userhub(self.src.clone(), self.source_account_id).await?;
-                        }
+                        // Update leader cache and converge followers
+                        let _ = self.update_src_position(&tr.contract_id, tr.side, tr.size).await;
+                        self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
+                        self.flatten_dest_if_needed(&tr.contract_id).await;
+                        self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
                     }
-                }
-                _ = sleep(Duration::from_millis(self.poll_interval_ms)) => {
-                    // periodic convergence and housekeeping
-                    if last_sync.elapsed() >= Duration::from_millis(self.sync_interval_ms) {
-                        let mut all_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
-                        { let sp = self.src_pos.read().await; for (_k, _v) in sp.iter() { all_contracts.insert(_k.1.clone()); } }
-                        { let dp = self.dest_pos.read().await; for (_k, _v) in dp.iter() { all_contracts.insert(_k.1.clone()); } }
-                        for cid in all_contracts.iter() { self.sync_dest_to_source_for_contract_live(cid).await; }
-                        last_sync = std::time::Instant::now();
+                    None => {
+                        // The RTC task ended (disconnect). Rebuild both the dest-pos channel and the hub.
+                        warn!("RTC trade channel closed; rebuilding connection");
+                        let (new_tx, new_rx) = mpsc::channel::<(i32, String, i32)>(1024);
+                        dest_pos_tx = new_tx;
+                        dest_pos_rx = new_rx;
+                        trade_rx = start_userhub(
+                            self.src.clone(),
+                            self.source_account_id,
+                            self.dest_account_ids.clone(),
+                            dest_pos_tx.clone(),
+                        ).await?;
                     }
                 }
             }
+
+            // ===== Follower positions from RTC =====
+            Some((dest_id, contract_id, signed_net)) = dest_pos_rx.recv() => {
+                let mut dp = self.dest_pos.write().await;
+                if signed_net == 0 {
+                    dp.remove(&(dest_id, contract_id.clone()));
+                } else {
+                    dp.insert((dest_id, contract_id.clone()), signed_net);
+                }
+            }
+
+            // ===== Periodic convergence WITHOUT REST =====
+            _ = sleep(Duration::from_millis(self.poll_interval_ms)) => {
+                if last_sync.elapsed() >= Duration::from_millis(self.sync_interval_ms) {
+                    use std::collections::HashSet;
+                    let mut all_contracts: HashSet<String> = HashSet::new();
+                    {
+                        let sp = self.src_pos.read().await;
+                        for (k, _) in sp.iter() { all_contracts.insert(k.1.clone()); }
+                    }
+                    {
+                        let dp = self.dest_pos.read().await;
+                        for (k, _) in dp.iter() { all_contracts.insert(k.1.clone()); }
+                    }
+                    for cid in all_contracts.iter() {
+                        self.sync_dest_to_source_for_contract_live(cid).await;
+                    }
+                    last_sync = Instant::now();
+                }
+            }
+        }
         }
     }
 }
