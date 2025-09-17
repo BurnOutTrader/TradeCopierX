@@ -1,6 +1,6 @@
 # TradeCopierX
 
-## TradeCopierX is a Rust-based trade copier for ProjectX (Topstep / AlphaTicks).
+## TradeCopierX is a Rust-based trade copier for ProjectX.
 It syncs positions from a leader account to one or more follower accounts.
 •	Leader (source) = the account whose positions are mirrored.
 •	Followers (destinations) = accounts that automatically copy trades from the leader.
