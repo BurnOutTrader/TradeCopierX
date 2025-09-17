@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 use tokio::time::{sleep, Instant};
 use crate::client::PxClient;
 use crate::models::PlaceOrderReq;
-use crate::rtc::{self, start_userhub, RtcEvent};
+use crate::rtc::{start_userhub, RtcEvent};
 use ahash::AHashMap;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -281,6 +281,17 @@ impl Copier {
                         self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
                         self.flatten_dest_if_needed(&tr.contract_id).await;
                         self.sync_dest_to_source_for_contract_live(&tr.contract_id).await;
+                    }
+                    Some(RtcEvent::SrcPosition { contract_id, signed_net }) => {
+                        // Update leader cache from position snapshot and converge followers
+                        {
+                            let mut sp = self.src_pos.write().await;
+                            let key = (self.source_account_id, contract_id.clone());
+                            if signed_net == 0 { sp.remove(&key); } else { sp.insert(key, signed_net); }
+                        }
+                        self.sync_dest_to_source_for_contract_live(&contract_id).await;
+                        self.flatten_dest_if_needed(&contract_id).await;
+                        self.sync_dest_to_source_for_contract_live(&contract_id).await;
                     }
                     None => {
                         // The RTC task ended (disconnect). Rebuild both the dest-pos channel and the hub.

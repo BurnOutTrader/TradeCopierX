@@ -1,8 +1,7 @@
 use std::sync::Arc;
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::{sync::mpsc, time::{sleep, Duration}};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::{client::PxClient, models::TradeRecord};
 
@@ -10,7 +9,7 @@ use crate::{client::PxClient, models::TradeRecord};
 #[derive(Debug, Clone)]
 pub enum RtcEvent {
     Trade(TradeRecord),
-    // We could add Order/Position if needed later
+    SrcPosition { contract_id: String, signed_net: i32 },
 }
 
 fn default_rtc_base() -> String {
@@ -132,12 +131,14 @@ pub async fn start_userhub(
                                                         && let Some(sz)  = first.get("size").and_then(|v| v.as_i64())
                                                     {
                                                         let acc_i32 = acc as i32;
-                                                        if dest_account_ids.iter().any(|&d| d == acc_i32) {
-                                                            let signed = match pt {
-                                                                1 =>  sz as i32,  // Long
-                                                                2 => -(sz as i32), // Short
-                                                                _ => 0,
-                                                            };
+                                                        let signed = match pt {
+                                                            1 =>  sz as i32,  // Long
+                                                            2 => -(sz as i32), // Short
+                                                            _ => 0,
+                                                        };
+                                                        if acc_i32 == source_account_id {
+                                                            let _ = tx.send(RtcEvent::SrcPosition { contract_id: cid.to_string(), signed_net: signed }).await;
+                                                        } else if dest_account_ids.iter().any(|&d| d == acc_i32) {
                                                             let _ = dest_pos_tx.send((acc_i32, cid.to_string(), signed)).await;
                                                         }
                                                     }
