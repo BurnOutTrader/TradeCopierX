@@ -4,6 +4,7 @@
 It syncs positions from a leader account to one or more follower accounts.
 - Leader (source) = the account whose positions are mirrored.
 - Followers (destinations) = accounts that automatically copy trades from the leader.
+- The best way is to copy to one account and then use ProjectX internal copy trader for sub followers.
 
 
 
@@ -86,22 +87,22 @@ On startup:
 ## Rate Limits
 
 ### Per ProjectX API docs:
--  200 requests / 60s for most endpoints.
-•	50 requests / 30s for history endpoints (not used by TradeCopierX).
+- 200 requests / 60s for most endpoints.
+- 50 requests / 30s for history endpoints (not used by TradeCopierX).
 
 ### TradeCopierX design:
-•	Leader poll: ~40 requests/min
-•	Leaves ~160 requests/min for follower orders
-•	Backoff + retry ensures resilience to 429 responses
+- Leader poll: ~40 requests/min
+- Leaves ~160 requests/min for follower orders
+- Backoff + retry ensures resilience to 429 responses
 
 ⸻
 
 ## Notes
-•	Only user hub endpoints are used (REST). Market hub is not used to avoid duplicate data logins.
-•	Follower state is maintained locally. Drift polling is optional.
-•	Errors (e.g. order rejections, API throttling) are logged via tracing.
+- Only user hub endpoints are used (REST). Market hub is not used to avoid duplicate data logins.
+- Follower state is maintained locally. Drift polling is optional.
+- Errors (e.g. order rejections, API throttling) are logged via tracing.
 
 ## Roadmap
-•	Multiple leader accounts
-•	Configurable resync strategies
-•	Order type flexibility (limit, stop)
+- Multiple leader accounts
+- Configurable resync strategies
+- Order type flexibility (limit, stop)
