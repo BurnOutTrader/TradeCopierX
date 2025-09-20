@@ -2,18 +2,19 @@
 
 ## TradeCopierX is a Rust-based trade copier for ProjectX.
 It syncs positions from a leader account to one or more follower accounts.
-•	Leader (source) = the account whose positions are mirrored.
-•	Followers (destinations) = accounts that automatically copy trades from the leader.
+- Leader (source) = the account whose positions are mirrored.
+- Followers (destinations) = accounts that automatically copy trades from the leader.
+
+
 
 ## Features
-•	REST-only design — avoids duplicate logins and CME rule violations by not using realtime hubs.
-•	Startup reconcile — aligns follower accounts to the leader’s open positions before running.
-•	Polling — leader positions are polled once every 1.5s (default), well within rate limits.
-•	Safe follower state — follower positions are tracked locally from the orders we place.
-•	Optional drift check — can poll follower positions to ensure they haven’t been manually altered.
-•	Rate-limit aware — avoids hitting ProjectX’s API caps (200 requests/minute).
+- REST-only design — avoids duplicate logins and CME rule violations by not using realtime hubs.
+- Startup reconcile — aligns follower accounts to the leader’s open positions before running.
+- Polling — leader positions are polled once every 1.5s (default), well within rate limits.
+- Safe follower state — follower positions are tracked locally from the orders we place.
+- Optional drift check — can poll follower positions to ensure they haven’t been manually altered.
+- Rate-limit aware — avoids hitting ProjectX’s API caps (200 requests/minute).
 
-⸻
 
 ## Requirements
 •	Rust (≥ 1.76.0 recommended)
@@ -85,7 +86,7 @@ On startup:
 ## Rate Limits
 
 ### Per ProjectX API docs:
-•	200 requests / 60s for most endpoints.
+-  200 requests / 60s for most endpoints.
 •	50 requests / 30s for history endpoints (not used by TradeCopierX).
 
 ### TradeCopierX design:
