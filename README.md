@@ -1,12 +1,8 @@
-# TradeCopierX
-
-## TradeCopierX is a Rust-based trade copier for ProjectX.
-It syncs positions from a leader account to one or more follower accounts.
+# TradeCopierX: Rust-based trade copier for ProjectX.
+TradeCopierX syncs positions from a leader account to one or more follower accounts.
 - Leader (source) = the account whose positions are mirrored.
 - Followers (destinations) = accounts that automatically copy trades from the leader.
 - The best way is to copy to one account and then use ProjectX internal copy trader for sub followers.
-
-
 
 ## Features
 - REST-only design — avoids duplicate logins and CME rule violations by not using realtime hubs.
@@ -18,11 +14,9 @@ It syncs positions from a leader account to one or more follower accounts.
 
 
 ## Requirements
-•	Rust (≥ 1.76.0 recommended)
-•	Cargo
-•	Access to ProjectX API (source + follower accounts)
-
-⸻
+- Rust (≥ 1.76.0 recommended)
+- Cargo
+- Access to ProjectX API (source + follower accounts)
 
 ## Installation
 
@@ -77,8 +71,8 @@ cargo run --release
 On startup:
 1.	The copier logs into leader and follower APIs.
 2.	Performs a one-time reconcile:
-•	Aligns all follower positions to leader.
-•	Closes contracts on followers where the leader is flat.
+   - Aligns all follower positions to leader.
+   - Closes contracts on followers where the leader is flat.
 3.	Begins polling the leader’s open positions every SOURCE_POLL_MS ms.
 4.	Applies changes to followers using market orders.
 
