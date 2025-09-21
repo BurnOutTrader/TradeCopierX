@@ -12,7 +12,6 @@ TradeCopierX syncs positions from a leader account to one or more follower accou
 - Optional drift check — can poll follower positions to ensure they haven’t been manually altered.
 - Rate-limit aware — avoids hitting ProjectX’s API caps (200 requests/minute).
 
-
 ## Requirements
 - Rust (≥ 1.76.0 recommended)
 - Cargo
@@ -30,8 +29,7 @@ Build
 cargo build --release
 ```
 
-Configuration
-
+## Configuration
 All settings are provided via a .env file in the project root.
 Example:
 ```dotenv
