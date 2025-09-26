@@ -47,6 +47,7 @@ pub struct AccountSearchRes {
 #[serde(rename_all = "camelCase")]
 pub struct PositionSearchOpenReq { pub account_id: i32 }
 
+#[allow(unused)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionRecord {
@@ -63,7 +64,40 @@ pub struct PositionRecord {
 #[serde(rename_all = "camelCase")]
 pub struct PositionSearchOpenRes { pub positions: Vec<PositionRecord> }
 
-// ===== Orders & trades =====
+// ===== Orders =====
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSearchOpenReq { pub account_id: i32 }
+
+#[allow(unused)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderRecord {
+    pub id: i64,
+    pub account_id: i32,
+    pub contract_id: String,
+    pub creation_timestamp: String,
+    pub update_timestamp: String,
+    pub status: i32,
+    pub r#type: i32, // 1=Limit, 2=Market, 4=Stop, 5=TrailingStop, 6=JoinBid, 7=JoinAsk
+    pub side: i32,   // 0=Bid, 1=Ask
+    pub size: i32,
+    #[serde(default)]
+    pub limit_price: Option<f64>,
+    #[serde(default)]
+    pub stop_price: Option<f64>,
+    #[serde(default)]
+    pub trail_price: Option<f64>,
+    #[serde(default)]
+    pub filled_price: Option<f64>,
+    #[serde(default)]
+    pub custom_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSearchOpenRes { pub orders: Vec<OrderRecord> }
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaceOrderReq<'a> {
@@ -81,6 +115,21 @@ pub struct PlaceOrderReq<'a> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaceOrderRes { pub order_id: i64 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModifyOrderReq {
+    pub account_id: i32,
+    pub order_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")] pub size: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub limit_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub stop_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub trail_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelOrderReq { pub account_id: i32, pub order_id: i64 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

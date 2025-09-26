@@ -18,6 +18,8 @@ pub struct Config {
     pub max_resync_step: i32,             // clamp per correction
     pub source_poll_ms: u64,              // leader polling cadence for Position/searchOpen
     pub enable_follower_drift_check: bool,// optional follower drift polling
+    pub enable_order_copy: bool,         // optional leader open orders mirroring (OFF by default)
+    pub order_poll_ms: u64,              // cadence for order polling (defaults to SOURCE_POLL_MS)
 }
 
 impl Config {
@@ -79,6 +81,15 @@ impl Config {
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false); // default OFF to save rate budget
 
+        let enable_order_copy = env::var("ORDER_COPY")
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false); // default OFF
+
+        let order_poll_ms = env::var("ORDER_POLL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(source_poll_ms);
+
         Ok(Self {
             src_api_base,
             src_auth: AuthMode::ApiKey { username: src_username, api_key: src_api_key },
@@ -90,6 +101,8 @@ impl Config {
             max_resync_step,
             source_poll_ms,
             enable_follower_drift_check,
+            enable_order_copy,
+            order_poll_ms,
         })
     }
 }

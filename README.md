@@ -10,7 +10,9 @@ TradeCopierX syncs positions from a leader account to one or more follower accou
 - Polling — leader positions are polled once every 1.5s (default), well within rate limits.
 - Safe follower state — follower positions are tracked locally from the orders we place.
 - Optional drift check — can poll follower positions to ensure they haven’t been manually altered.
+- Optional order mirroring — can poll leader open orders and mirror create/modify/cancel to followers (OFF by default).
 - Rate-limit aware — avoids hitting ProjectX’s API caps (200 requests/minute).
+- Optional Order copying for Limit and Stop orders (Totally untested)
 
 ## Requirements
 - Rust (≥ 1.76.0 recommended)
@@ -56,6 +58,12 @@ SOURCE_POLL_MS=1500
 # ========= Optional follower drift polling (OFF by default) =========
 # Set to 1 to poll follower positions every ~3s
 FOLLOWER_DRIFT_CHECK=0
+
+# ========= Optional: order mirroring (OFF by default) =========
+# Set to 1/true to poll leader open orders and mirror create/modify/cancel
+ORDER_COPY=0
+# Optionally override order polling cadence (defaults to SOURCE_POLL_MS)
+ORDER_POLL_MS=1500
 
 # ========= Optional tuning =========
 PX_MAX_RESYNC=2147483647

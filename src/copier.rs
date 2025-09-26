@@ -1,5 +1,5 @@
 use crate::client::PxClient;
-use crate::models::{PlaceOrderReq, PositionRecord};
+use crate::models::{PlaceOrderReq, PositionRecord, OrderRecord, ModifyOrderReq};
 use ahash::AHashMap;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -24,6 +24,8 @@ pub struct Copier {
     pub max_resync_step: i32,
     pub source_poll_ms: u64,
     pub enable_follower_drift_check: bool,
+    pub enable_order_copy: bool,
+    pub order_poll_ms: u64,
 
     // In-memory running positions, keyed by (accountId, contractId)
     pub src_pos: Arc<RwLock<AHashMap<(i32, String), i32>>>,   // source net position per contract
@@ -39,10 +41,14 @@ impl Copier {
         max_resync_step: i32,
         source_poll_ms: u64,
         enable_follower_drift_check: bool,
+        enable_order_copy: bool,
+        order_poll_ms: u64,
     ) -> Self {
         Self {
             src, dests, source_account_id, dest_account_ids, max_resync_step, source_poll_ms,
             enable_follower_drift_check,
+            enable_order_copy,
+            order_poll_ms,
             src_pos: Arc::new(RwLock::new(AHashMap::new())),
             dest_pos: Arc::new(RwLock::new(AHashMap::new())),
         }
@@ -119,12 +125,6 @@ impl Copier {
         }
 
         info!("Startup reconcile: complete");
-    }
-
-    #[inline]
-    fn delta(side: i32, size: i32) -> i32 {
-        // 0=Bid/buy => +size, 1=Ask/sell => -size
-        if side == 0 { size } else { -size }
     }
 
     async fn set_src_snapshot(&self, snapshot: &[(String, i32)]) {
@@ -296,6 +296,152 @@ impl Copier {
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            });
+        }
+
+        // Optional: order mirroring loop (OFF by default)
+        if self.enable_order_copy {
+            let src = self.src.clone();
+            let source_account_id = self.source_account_id;
+            let dest_clients = self.dests.clone();
+            let dest_ids = self.dest_account_ids.clone();
+            let poll_ms = self.order_poll_ms;
+
+            #[derive(Clone, Debug, PartialEq)]
+            struct OrderSnap {
+                contract_id: String,
+                r#type: i32,
+                side: i32,
+                size: i32,
+                limit_price: Option<f64>,
+                stop_price: Option<f64>,
+                trail_price: Option<f64>,
+            }
+            fn snap_from(o: &OrderRecord) -> OrderSnap {
+                OrderSnap {
+                    contract_id: o.contract_id.clone(),
+                    r#type: o.r#type,
+                    side: o.side,
+                    size: o.size,
+                    limit_price: o.limit_price,
+                    stop_price: o.stop_price,
+                    trail_price: o.trail_price,
+                }
+            }
+
+            tokio::spawn(async move {
+                use ahash::AHashMap;
+                let mut last: AHashMap<i64, OrderSnap> = AHashMap::new();
+                let mut map_dest_order: AHashMap<(i32, i64), i64> = AHashMap::new();
+                loop {
+                    match src.search_open_orders(source_account_id).await {
+                        Ok(res) => {
+                            let mut current: AHashMap<i64, OrderSnap> = AHashMap::new();
+                            for o in res.orders {
+                                current.insert(o.id, snap_from(&o));
+                            }
+
+                            // New orders
+                            for (oid, snap) in current.iter() {
+                                if !last.contains_key(oid) {
+                                    let n = dest_clients.len().min(dest_ids.len());
+                                    for i in 0..n {
+                                        let dest = dest_ids[i];
+                                        let client = &dest_clients[i];
+                                        let tag = Some(format!("TCX:ORD:{}", oid));
+                                        let req = PlaceOrderReq {
+                                            account_id: dest,
+                                            contract_id: &snap.contract_id,
+                                            r#type: snap.r#type,
+                                            side: snap.side,
+                                            size: snap.size,
+                                            limit_price: snap.limit_price,
+                                            stop_price: snap.stop_price,
+                                            trail_price: snap.trail_price,
+                                            custom_tag: tag,
+                                            linked_order_id: None,
+                                        };
+                                        match client.place_order(&req).await {
+                                            Ok(r) => {
+                                                info!("Order copy: placed dest {} for leader order {} => dest order {}", dest, oid, r.order_id);
+                                                map_dest_order.insert((dest, *oid), r.order_id);
+                                            }
+                                            Err(e) => warn!("Order copy: failed to place for leader order {} on dest {}: {}", oid, dest, e),
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Removed orders
+                            for (oid, _snap) in last.iter() {
+                                if !current.contains_key(oid) {
+                                    let n = dest_clients.len().min(dest_ids.len());
+                                    for i in 0..n {
+                                        let dest = dest_ids[i];
+                                        if let Some(&d_oid) = map_dest_order.get(&(dest, *oid)) {
+                                            let client = &dest_clients[i];
+                                            if let Err(e) = client.cancel_order(dest, d_oid).await {
+                                                warn!("Order copy: failed to cancel dest {} for leader order {}: {}", dest, oid, e);
+                                            } else {
+                                                info!("Order copy: cancelled dest {} order {} (leader order {} gone)", dest, d_oid, oid);
+                                                map_dest_order.remove(&(dest, *oid));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Modified orders
+                            for (oid, snap_now) in current.iter() {
+                                if let Some(prev) = last.get(oid) {
+                                    if prev != snap_now {
+                                        let n = dest_clients.len().min(dest_ids.len());
+                                        for i in 0..n {
+                                            let dest = dest_ids[i];
+                                            let client = &dest_clients[i];
+                                            if let Some(&d_oid) = map_dest_order.get(&(dest, *oid)) {
+                                                let mreq = ModifyOrderReq {
+                                                    account_id: dest,
+                                                    order_id: d_oid,
+                                                    size: Some(snap_now.size),
+                                                    limit_price: snap_now.limit_price,
+                                                    stop_price: snap_now.stop_price,
+                                                    trail_price: snap_now.trail_price,
+                                                };
+                                                match client.modify_order(&mreq).await {
+                                                    Ok(()) => info!("Order copy: modified dest {} order {} to mirror leader {}", dest, d_oid, oid),
+                                                    Err(e) => warn!("Order copy: modify failed on dest {} order {}: {}", dest, d_oid, e),
+                                                }
+                                            } else {
+                                                // No mapping (e.g., restart) — place new
+                                                let tag = Some(format!("TCX:ORD:{}", oid));
+                                                let req = PlaceOrderReq {
+                                                    account_id: dest,
+                                                    contract_id: &snap_now.contract_id,
+                                                    r#type: snap_now.r#type,
+                                                    side: snap_now.side,
+                                                    size: snap_now.size,
+                                                    limit_price: snap_now.limit_price,
+                                                    stop_price: snap_now.stop_price,
+                                                    trail_price: snap_now.trail_price,
+                                                    custom_tag: tag,
+                                                    linked_order_id: None,
+                                                };
+                                                if let Ok(r) = client.place_order(&req).await {
+                                                    map_dest_order.insert((dest, *oid), r.order_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            last = current;
+                        }
+                        Err(e) => warn!("Order copy: leader order poll failed: {}", e),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
                 }
             });
         }

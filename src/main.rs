@@ -70,6 +70,8 @@ async fn main() -> Result<()> {
         cfg.max_resync_step,
         cfg.source_poll_ms,     // leader poll: Position/searchOpen every N ms
         cfg.enable_follower_drift_check, // optional drift check
+        cfg.enable_order_copy,  // optional order mirroring
+        cfg.order_poll_ms,
     );
 
     // One-time reconcile via REST (align followers to leader)

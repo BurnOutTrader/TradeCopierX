@@ -130,7 +130,15 @@ impl PxClient {
                     .map(|sec| sec * 1000);
 
                 // Retry critical endpoints more; others return error faster
-                let is_critical = matches!(path, "/api/Order/place" | "/api/Position/closeContract" | "/api/Position/searchOpen" | "/api/Account/search");
+                let is_critical = matches!(path,
+                                    "/api/Order/place"
+                                    | "/api/Order/modify"
+                                    | "/api/Order/cancel"
+                                    | "/api/Order/searchOpen"
+                                    | "/api/Position/closeContract"
+                                    | "/api/Position/searchOpen"
+                                    | "/api/Account/search"
+                                );
                 if !is_critical {
                     let txt = resp.text().await.unwrap_or_default();
                     return Err(anyhow!("HTTP {} on {} — {}", status, path, txt));
@@ -191,5 +199,22 @@ impl PxClient {
     pub async fn search_open_positions(&self, account_id: i32) -> anyhow::Result<PositionSearchOpenRes> {
         let req = PositionSearchOpenReq { account_id };
         self.authed_post("/api/Position/searchOpen", &req).await
+    }
+
+    // Orders
+    pub async fn search_open_orders(&self, account_id: i32) -> anyhow::Result<OrderSearchOpenRes> {
+        let req = OrderSearchOpenReq { account_id };
+        self.authed_post("/api/Order/searchOpen", &req).await
+    }
+
+    pub async fn modify_order(&self, req: &ModifyOrderReq) -> anyhow::Result<()> {
+        let _void: serde_json::Value = self.authed_post("/api/Order/modify", req).await?;
+        Ok(())
+    }
+
+    pub async fn cancel_order(&self, account_id: i32, order_id: i64) -> anyhow::Result<()> {
+        let req = CancelOrderReq { account_id, order_id };
+        let _void: serde_json::Value = self.authed_post("/api/Order/cancel", &req).await?;
+        Ok(())
     }
 }
