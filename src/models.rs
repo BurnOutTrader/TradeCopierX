@@ -116,6 +116,14 @@ pub struct OrderSearchOpenRes { pub orders: Vec<OrderRecord> }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StopLossBracket { pub ticks: i32, pub r#type: i32 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeProfitBracket { pub ticks: i32, pub r#type: i32 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlaceOrderReq<'a> {
     pub account_id: i32,
     pub contract_id: &'a str,
@@ -127,6 +135,8 @@ pub struct PlaceOrderReq<'a> {
     #[serde(skip_serializing_if = "Option::is_none")] pub trail_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")] pub custom_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub linked_order_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub stop_loss_bracket: Option<StopLossBracket>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub take_profit_bracket: Option<TakeProfitBracket>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

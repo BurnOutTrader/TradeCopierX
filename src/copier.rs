@@ -202,6 +202,8 @@ impl Copier {
                 trail_price: None,
                 custom_tag: Some(tag),
                 linked_order_id: None,
+                stop_loss_bracket: None,
+                take_profit_bracket: None,
             };
 
             let client = &self.dests[i];
@@ -257,6 +259,8 @@ impl Copier {
                 trail_price: None,
                 custom_tag: Some(tag),
                 linked_order_id: None,
+                stop_loss_bracket: None,
+                take_profit_bracket: None,
             };
             // find paired client index for this dest
             if let Some(i) = self.dest_account_ids.iter().position(|&d| d == dest) {
@@ -337,6 +341,7 @@ impl Copier {
             let src_pos = self.src_pos.clone();
             let dest_pos = self.dest_pos.clone();
             let order_catchup_ms = self.order_catchup_ms;
+            let src_stable = self.src_stable.clone();
 
             #[derive(Clone, Debug, PartialEq)]
             struct OrderSnap {
@@ -415,6 +420,8 @@ impl Copier {
                                         trail_price: snap.trail_price,
                                         custom_tag: tag,
                                         linked_order_id: None,
+                                        stop_loss_bracket: None,
+                                        take_profit_bracket: None,
                                     };
                                     match client.place_order(&req).await {
                                         Ok(r) => {
@@ -444,6 +451,8 @@ impl Copier {
                                                 trail_price: snap.trail_price,
                                                 custom_tag: tag,
                                                 linked_order_id: Some(parent_dest_id),
+                                                stop_loss_bracket: None,
+                                                take_profit_bracket: None,
                                             };
                                             match client.place_order(&req).await {
                                                 Ok(r) => {
@@ -467,6 +476,8 @@ impl Copier {
                                                 trail_price: snap.trail_price,
                                                 custom_tag: tag,
                                                 linked_order_id: None,
+                                                stop_loss_bracket: None,
+                                                take_profit_bracket: None,
                                             };
                                             match client.place_order(&req).await {
                                                 Ok(r) => {
@@ -482,10 +493,6 @@ impl Copier {
 
                             // Pull recent fills from history to detect leader-filled orders
                             let mut filled_leader_oids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-                            {
-                                let now = chrono::Utc::now();
-                                static SKIP: i32 = 0; // just to allow a block
-                            }
                             // Maintain a sliding window based on local time
                             use chrono::{Duration, SecondsFormat, Utc};
                             static mut LAST_HIST_TS: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -527,6 +534,7 @@ impl Copier {
                                                 let dest_id_clone = dest;
                                                 let source_account_id_clone = source_account_id;
                                                 let order_id_clone = d_oid;
+                                                let src_stable_clone = src_stable.clone();
                                                 tokio::spawn(async move {
                                                     tokio::time::sleep(std::time::Duration::from_millis(order_catchup_ms)).await;
                                                     // attempt to cancel the lingering follower order
@@ -542,6 +550,21 @@ impl Copier {
                                                     };
                                                     let diff = leader_net - dest_net;
                                                     if diff != 0 {
+                                                        // Apply stability gate to avoid accidental re-entry while leader cache hasn't refreshed
+                                                        let pre_abs = dest_net.abs();
+                                                        let post_abs = (dest_net + diff).abs();
+                                                        if post_abs > pre_abs {
+                                                            let stable_ok = {
+                                                                let st = src_stable_clone.read().await;
+                                                                if let Some((last_net, cnt)) = st.get(&contract) {
+                                                                    *last_net == leader_net && *cnt >= 2
+                                                                } else { false }
+                                                            };
+                                                            if !stable_ok {
+                                                                info!("Catch-up gate: skipping increase on {} for dest {} (leader_net {}, dest_net {}, diff {}) until leader stabilizes", contract, dest_id_clone, leader_net, dest_net, diff);
+                                                                return; // do not increase exposure here; main loop will resync when stable
+                                                            }
+                                                        }
                                                         let side = if diff > 0 { 0 } else { 1 };
                                                         let size = diff.abs();
                                                         let tag = format!("TCX:CATCHUP:{}:{}:{}", contract, dest_id_clone, diff);
@@ -556,6 +579,8 @@ impl Copier {
                                                             trail_price: None,
                                                             custom_tag: Some(tag),
                                                             linked_order_id: None,
+                                                            stop_loss_bracket: None,
+                                                            take_profit_bracket: None,
                                                         };
                                                         match client_clone.place_order(&req).await {
                                                             Ok(_r) => {
@@ -639,6 +664,8 @@ impl Copier {
                                                     trail_price: snap_now.trail_price,
                                                     custom_tag: tag,
                                                     linked_order_id: linked,
+                                                    stop_loss_bracket: None,
+                                                    take_profit_bracket: None,
                                                 };
                                                 if let Ok(r) = client.place_order(&req).await {
                                                     map_dest_order.insert((dest, *oid), r.order_id);
