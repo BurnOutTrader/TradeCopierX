@@ -18,7 +18,7 @@ fn unique_sync_tag(contract_id: &str, dest: i32, step: i32) -> String {
 
 pub struct Copier {
     pub src: Arc<PxClient>,
-    pub dest: Arc<PxClient>,
+    pub dests: Vec<Arc<PxClient>>, // support multiple follower firms/clients
     pub source_account_id: i32,
     pub dest_account_ids: Vec<i32>,
     pub max_resync_step: i32,
@@ -33,7 +33,7 @@ pub struct Copier {
 impl Copier {
     pub fn new(
         src: Arc<PxClient>,
-        dest: Arc<PxClient>,
+        dests: Vec<Arc<PxClient>>,
         source_account_id: i32,
         dest_account_ids: Vec<i32>,
         max_resync_step: i32,
@@ -41,7 +41,7 @@ impl Copier {
         enable_follower_drift_check: bool,
     ) -> Self {
         Self {
-            src, dest, source_account_id, dest_account_ids, max_resync_step, source_poll_ms,
+            src, dests, source_account_id, dest_account_ids, max_resync_step, source_poll_ms,
             enable_follower_drift_check,
             src_pos: Arc::new(RwLock::new(AHashMap::new())),
             dest_pos: Arc::new(RwLock::new(AHashMap::new())),
@@ -74,9 +74,12 @@ impl Copier {
             Err(e) => warn!("Startup reconcile: failed to load source positions: {}", e),
         }
 
-        // 2) For each follower, seed follower cache and close any contract leader is flat on
-        for &dest in &self.dest_account_ids {
-            match self.dest.search_open_positions(dest).await {
+        // 2) For each follower (paired by index), seed follower cache and close any contract leader is flat on
+        let n = self.dests.len().min(self.dest_account_ids.len());
+        for i in 0..n {
+            let client = &self.dests[i];
+            let dest = self.dest_account_ids[i];
+            match client.search_open_positions(dest).await {
                 Ok(res) => {
                     // seed cache
                     {
@@ -96,7 +99,7 @@ impl Copier {
                             let net = Self::signed_net_from_record(&p);
                             if net != 0 {
                                 info!("Startup reconcile: closing {} on dest {} (leader flat)", p.contract_id, dest);
-                                if let Err(e) = self.dest.close_contract(dest, &p.contract_id).await {
+                                if let Err(e) = client.close_contract(dest, &p.contract_id).await {
                                     warn!("Failed to close {} on dest {}: {}", p.contract_id, dest, e);
                                 } else {
                                     let mut dp = self.dest_pos.write().await;
@@ -148,7 +151,9 @@ impl Copier {
             Some(net) => *net,
         };
 
-        for &dest in &self.dest_account_ids {
+        let n = self.dests.len().min(self.dest_account_ids.len());
+        for i in 0..n {
+            let dest = self.dest_account_ids[i];
             let dest_net = self.get_dest_net_cached(dest, contract_id).await;
             let diff = src_net - dest_net;
             if diff == 0 { continue; }
@@ -172,13 +177,14 @@ impl Copier {
                 linked_order_id: None,
             };
 
-            match self.dest.place_order(&req).await {
+            let client = &self.dests[i];
+            match client.place_order(&req).await {
                 Ok(resp) => {
                     info!(
                         "Sync {}: adjusted dest {} by {} (leader net {}) via order {}",
                         contract_id, dest, step, src_net, resp.order_id
                     );
-                    // set follower cache to leader net after our order
+                    // set follower cache to leader net after order success
                     let mut dp = self.dest_pos.write().await;
                     if src_net == 0 {
                         dp.remove(&(dest, contract_id.to_string()));
@@ -225,13 +231,19 @@ impl Copier {
                 custom_tag: Some(tag),
                 linked_order_id: None,
             };
-            match self.dest.place_order(&req).await {
-                Ok(resp) => {
-                    info!("Flattened acct {} on {} with order {} (pos was {})", dest, contract_id, resp.order_id, pos);
-                    let mut dest_map = self.dest_pos.write().await;
-                    dest_map.remove(&(dest, contract_id.to_string()));
+            // find paired client index for this dest
+            if let Some(i) = self.dest_account_ids.iter().position(|&d| d == dest) {
+                let client = &self.dests[i];
+                match client.place_order(&req).await {
+                    Ok(resp) => {
+                        info!("Flattened acct {} on {} with order {} (pos was {})", dest, contract_id, resp.order_id, pos);
+                        let mut dest_map = self.dest_pos.write().await;
+                        dest_map.remove(&(dest, contract_id.to_string()));
+                    }
+                    Err(e) => error!("Failed to flatten acct {} on {}: {}", dest, contract_id, e),
                 }
-                Err(e) => error!("Failed to flatten acct {} on {}: {}", dest, contract_id, e),
+            } else {
+                warn!("No client paired for destination account {} during flatten", dest);
             }
         }
     }
@@ -258,13 +270,16 @@ impl Copier {
 
         // Optional follower drift checker (OFF by default)
         if self.enable_follower_drift_check {
-            let dest_client = self.dest.clone();
+            let dest_clients = self.dests.clone();
             let dest_ids = self.dest_account_ids.clone();
             let dest_pos = self.dest_pos.clone();
             tokio::spawn(async move {
                 loop {
-                    for &dest in &dest_ids {
-                        match dest_client.search_open_positions(dest).await {
+                    let n = dest_clients.len().min(dest_ids.len());
+                    for i in 0..n {
+                        let client = &dest_clients[i];
+                        let dest = dest_ids[i];
+                        match client.search_open_positions(dest).await {
                             Ok(res) => {
                                 let mut dp = dest_pos.write().await;
                                 dp.retain(|(acc, _), _| *acc != dest);

@@ -39,11 +39,15 @@ SRC_USERNAME=your-leader-username
 SRC_API_KEY=your-leader-api-key
 SOURCE_ACCOUNT=EXPRESS-V2-12345-67890123   # or numeric account ID
 
-# ========= Follower (destination) =========
-DEST_API_BASE=https://api.alphaticks.projectx.com
-DEST_USERNAME=your-follower-username
-DEST_API_KEY=your-follower-api-key
-DEST_ACCOUNTS=202509092164,202509092165    # comma-separated if multiple
+# ========= Followers (destinations) =========
+# Provide aligned comma-separated lists. Index 0 in each list refers to the same destination firm.
+# IMPORTANT: Exactly ONE account per destination API. If you want to fan out to many accounts
+# within a firm, configure that firm’s internal copy trader to follow the specified account.
+DEST_API_BASES=https://api.alphaticks.projectx.com,https://api.tradeify.projectx.com
+DEST_USERNAMES=your-follower-username-1,your-follower-username-2
+DEST_API_KEYS=your-follower-api-key-1,your-follower-api-key-2
+# One account per destination API, aligned by index:
+DEST_ACCOUNTS=202509092164,LEADER-ACCOUNT-NAME-OR-ID
 
 # ========= Polling cadence (leader only) =========
 # 1500 ms = ~40 req/min (leaving ~160/min for orders)

@@ -26,30 +26,45 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     info!("SRC_API_BASE={}", cfg.src_api_base);
-    info!("DEST_API_BASE={}", cfg.dest_api_base);
 
     // Build clients
     let src = Arc::new(PxClient::new(cfg.src_api_base.clone(), cfg.src_auth.clone()));
-    let dest = Arc::new(PxClient::new(cfg.dest_api_base.clone(), cfg.dest_auth.clone()));
 
-    // Pre-auth both
+    // Pre-auth source
     let _ = src.login().await.context("src login failed")?;
-    let _ = dest.login().await.context("dest login failed")?;
 
-    // Resolve account IDs (accept numeric or account name)
+    // Resolve source account ID (accept numeric or account name)
     let src_id = resolve_account_id(&src, &cfg.source_account).await?;
+
+    // Build destination clients aligned with accounts
+    if cfg.dest_api_bases.is_empty() {
+        return Err(anyhow!("No destination firms provided (set DEST_API_BASES or legacy DEST_API_BASE)"));
+    }
     if cfg.dest_accounts.is_empty() {
         return Err(anyhow!("No destination accounts provided (set DEST_ACCOUNTS in .env)"));
     }
-    let mut dest_ids = Vec::new();
-    for a in &cfg.dest_accounts {
-        dest_ids.push(resolve_account_id(&dest, a).await?);
+    let mut dest_clients: Vec<Arc<PxClient>> = Vec::new();
+    let mut dest_ids: Vec<i32> = Vec::new();
+    for i in 0..cfg.dest_api_bases.len() {
+        let client = Arc::new(PxClient::new(
+            cfg.dest_api_bases[i].clone(),
+            crate::models::AuthMode::ApiKey {
+                username: cfg.dest_usernames[i].clone(),
+                api_key: cfg.dest_api_keys[i].clone(),
+            },
+        ));
+        // login each dest client
+        let _ = client.login().await.context("dest login failed")?;
+        // resolve its paired account id
+        let acc_id = resolve_account_id(&client, &cfg.dest_accounts[i]).await?;
+        dest_clients.push(client);
+        dest_ids.push(acc_id);
     }
 
     // Construct copier
     let copier = Copier::new(
         src.clone(),
-        dest.clone(),
+        dest_clients,
         src_id,
         dest_ids,
         cfg.max_resync_step,
