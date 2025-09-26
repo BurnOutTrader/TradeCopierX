@@ -135,6 +135,7 @@ impl PxClient {
                                     | "/api/Order/modify"
                                     | "/api/Order/cancel"
                                     | "/api/Order/searchOpen"
+                                    | "/api/Order/search"
                                     | "/api/Position/closeContract"
                                     | "/api/Position/searchOpen"
                                     | "/api/Account/search"
@@ -205,6 +206,15 @@ impl PxClient {
     pub async fn search_open_orders(&self, account_id: i32) -> anyhow::Result<OrderSearchOpenRes> {
         let req = OrderSearchOpenReq { account_id };
         self.authed_post("/api/Order/searchOpen", &req).await
+    }
+
+    pub async fn search_orders(&self, account_id: i32, start_timestamp: &str, end_timestamp: Option<&str>) -> anyhow::Result<OrderSearchRes> {
+        let req = OrderSearchReq {
+            account_id,
+            start_timestamp: start_timestamp.to_string(),
+            end_timestamp: end_timestamp.map(|s| s.to_string()),
+        };
+        self.authed_post("/api/Order/search", &req).await
     }
 
     pub async fn modify_order(&self, req: &ModifyOrderReq) -> anyhow::Result<()> {

@@ -20,6 +20,7 @@ pub struct Config {
     pub enable_follower_drift_check: bool,// optional follower drift polling
     pub enable_order_copy: bool,         // optional leader open orders mirroring (OFF by default)
     pub order_poll_ms: u64,              // cadence for order polling (defaults to SOURCE_POLL_MS)
+    pub order_catchup_ms: u64,           // delay before forcing market sync after leader fill
 }
 
 impl Config {
@@ -90,6 +91,11 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(source_poll_ms);
 
+        let order_catchup_ms = env::var("ORDER_CATCHUP_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2000);
+
         Ok(Self {
             src_api_base,
             src_auth: AuthMode::ApiKey { username: src_username, api_key: src_api_key },
@@ -103,6 +109,7 @@ impl Config {
             enable_follower_drift_check,
             enable_order_copy,
             order_poll_ms,
+            order_catchup_ms,
         })
     }
 }

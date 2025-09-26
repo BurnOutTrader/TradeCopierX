@@ -69,6 +69,18 @@ pub struct PositionSearchOpenRes { pub positions: Vec<PositionRecord> }
 #[serde(rename_all = "camelCase")]
 pub struct OrderSearchOpenReq { pub account_id: i32 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSearchReq {
+    pub account_id: i32,
+    pub start_timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub end_timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSearchRes { pub orders: Vec<OrderRecord> }
+
 #[allow(unused)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +100,8 @@ pub struct OrderRecord {
     pub stop_price: Option<f64>,
     #[serde(default)]
     pub trail_price: Option<f64>,
+    #[serde(default)]
+    pub fill_volume: Option<i32>,
     #[serde(default)]
     pub filled_price: Option<f64>,
     #[serde(default)]

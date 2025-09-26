@@ -26,10 +26,14 @@ pub struct Copier {
     pub enable_follower_drift_check: bool,
     pub enable_order_copy: bool,
     pub order_poll_ms: u64,
+    pub order_catchup_ms: u64,
 
     // In-memory running positions, keyed by (accountId, contractId)
     pub src_pos: Arc<RwLock<AHashMap<(i32, String), i32>>>,   // source net position per contract
     pub dest_pos: Arc<RwLock<AHashMap<(i32, String), i32>>>,  // destination net position per contract
+
+    // Track leader stability per contract: (last_net, consecutive_count)
+    pub src_stable: Arc<RwLock<AHashMap<String, (i32, u32)>>>,
 }
 
 impl Copier {
@@ -43,14 +47,17 @@ impl Copier {
         enable_follower_drift_check: bool,
         enable_order_copy: bool,
         order_poll_ms: u64,
+        order_catchup_ms: u64,
     ) -> Self {
         Self {
             src, dests, source_account_id, dest_account_ids, max_resync_step, source_poll_ms,
             enable_follower_drift_check,
             enable_order_copy,
             order_poll_ms,
+            order_catchup_ms,
             src_pos: Arc::new(RwLock::new(AHashMap::new())),
             dest_pos: Arc::new(RwLock::new(AHashMap::new())),
+            src_stable: Arc::new(RwLock::new(AHashMap::new())),
         }
     }
 
@@ -160,6 +167,26 @@ impl Copier {
 
             let step = diff.clamp(-self.max_resync_step, self.max_resync_step);
             if step == 0 { continue; }
+
+            // Anti-churn stability gate: when ORDER_COPY is enabled, avoid increasing follower exposure
+            // unless the leader net has been stable for at least 2 consecutive polls.
+            if self.enable_order_copy {
+                let pre_abs = dest_net.abs();
+                let post_abs = (dest_net + step).abs();
+                if post_abs > pre_abs {
+                    let stable_ok = {
+                        let st = self.src_stable.read().await;
+                        if let Some((last_net, cnt)) = st.get(contract_id) {
+                            *last_net == src_net && *cnt >= 2
+                        } else { false }
+                    };
+                    if !stable_ok {
+                        info!("Stability gate: deferring increase on {} for dest {} (src_net {}, dest_net {}, step {})", contract_id, dest, src_net, dest_net, step);
+                        continue;
+                    }
+                }
+            }
+
             let side = if step > 0 { 0 } else { 1 };
             let size = step.abs();
             let tag = unique_sync_tag(contract_id, dest, step);
@@ -308,6 +335,8 @@ impl Copier {
             let dest_ids = self.dest_account_ids.clone();
             let poll_ms = self.order_poll_ms;
             let src_pos = self.src_pos.clone();
+            let dest_pos = self.dest_pos.clone();
+            let order_catchup_ms = self.order_catchup_ms;
 
             #[derive(Clone, Debug, PartialEq)]
             struct OrderSnap {
@@ -451,14 +480,101 @@ impl Copier {
                                 }
                             }
 
+                            // Pull recent fills from history to detect leader-filled orders
+                            let mut filled_leader_oids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                            {
+                                let now = chrono::Utc::now();
+                                static SKIP: i32 = 0; // just to allow a block
+                            }
+                            // Maintain a sliding window based on local time
+                            use chrono::{Duration, SecondsFormat, Utc};
+                            static mut LAST_HIST_TS: Option<chrono::DateTime<chrono::Utc>> = None;
+                            let start_ts = unsafe {
+                                let prev = LAST_HIST_TS.unwrap_or_else(|| Utc::now() - Duration::milliseconds(poll_ms as i64));
+                                // slight overlap to avoid gaps
+                                (prev - Duration::milliseconds(200))
+                            };
+                            let start_str = start_ts.to_rfc3339_opts(SecondsFormat::Micros, true);
+                            match src.search_orders(source_account_id, &start_str, None).await {
+                                Ok(hist) => {
+                                    for o in hist.orders {
+                                        if o.status == 2 || o.fill_volume.unwrap_or(0) > 0 {
+                                            filled_leader_oids.insert(o.id);
+                                        }
+                                    }
+                                    unsafe { LAST_HIST_TS = Some(Utc::now()); }
+                                }
+                                Err(e) => {
+                                    warn!("Order copy: Order/search failed: {}", e);
+                                }
+                            }
+
                             // Removed orders
-                            for (oid, _snap) in last.iter() {
+                            for (oid, snap_prev) in last.iter() {
                                 if !current.contains_key(oid) {
                                     let n = dest_clients.len().min(dest_ids.len());
                                     for i in 0..n {
                                         let dest = dest_ids[i];
                                         if let Some(&d_oid) = map_dest_order.get(&(dest, *oid)) {
                                             let client = &dest_clients[i];
+
+                                            // If the leader removal corresponds to a fill, schedule catch-up: cancel + market-sync after delay
+                                            if filled_leader_oids.contains(oid) {
+                                                let contract = snap_prev.contract_id.clone();
+                                                let src_pos_clone = src_pos.clone();
+                                                let dest_pos_clone = dest_pos.clone();
+                                                let client_clone = client.clone();
+                                                let dest_id_clone = dest;
+                                                let source_account_id_clone = source_account_id;
+                                                let order_id_clone = d_oid;
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(order_catchup_ms)).await;
+                                                    // attempt to cancel the lingering follower order
+                                                    let _ = client_clone.cancel_order(dest_id_clone, order_id_clone).await;
+                                                    // compute diff vs leader and market-sync if needed
+                                                    let leader_net = {
+                                                        let sp = src_pos_clone.read().await;
+                                                        *sp.get(&(source_account_id_clone, contract.clone())).unwrap_or(&0)
+                                                    };
+                                                    let dest_net = {
+                                                        let dp = dest_pos_clone.read().await;
+                                                        *dp.get(&(dest_id_clone, contract.clone())).unwrap_or(&0)
+                                                    };
+                                                    let diff = leader_net - dest_net;
+                                                    if diff != 0 {
+                                                        let side = if diff > 0 { 0 } else { 1 };
+                                                        let size = diff.abs();
+                                                        let tag = format!("TCX:CATCHUP:{}:{}:{}", contract, dest_id_clone, diff);
+                                                        let req = PlaceOrderReq {
+                                                            account_id: dest_id_clone,
+                                                            contract_id: &contract,
+                                                            r#type: 2,
+                                                            side,
+                                                            size,
+                                                            limit_price: None,
+                                                            stop_price: None,
+                                                            trail_price: None,
+                                                            custom_tag: Some(tag),
+                                                            linked_order_id: None,
+                                                        };
+                                                        match client_clone.place_order(&req).await {
+                                                            Ok(_r) => {
+                                                                // update cache to leader net
+                                                                let mut dpw = dest_pos_clone.write().await;
+                                                                if leader_net == 0 {
+                                                                    dpw.remove(&(dest_id_clone, contract.clone()));
+                                                                } else {
+                                                                    dpw.insert((dest_id_clone, contract.clone()), leader_net);
+                                                                }
+                                                                info!("Catch-up: synced {} on dest {} to leader {} via market", contract, dest_id_clone, leader_net);
+                                                            }
+                                                            Err(e) => warn!("Catch-up: failed to place market on dest {} for {}: {}", dest_id_clone, contract, e),
+                                                        }
+                                                    }
+                                                });
+                                            }
+
+                                            // Always try to cancel mapped follower order when leader removes it
                                             if let Err(e) = client.cancel_order(dest, d_oid).await {
                                                 warn!("Order copy: failed to cancel dest {} for leader order {}: {}", dest, oid, e);
                                             } else {
@@ -552,6 +668,26 @@ impl Copier {
                         let net = Self::signed_net_from_record(&p);
                         if net != 0 {
                             current.insert(p.contract_id.clone(), net);
+                        }
+                    }
+
+                    // Update leader stability counts (consecutive identical snapshots)
+                    {
+                        let mut st = self.src_stable.write().await;
+                        for (cid, &net) in current.iter() {
+                            match st.get_mut(cid) {
+                                Some((last_net, cnt)) => {
+                                    if *last_net == net {
+                                        *cnt = cnt.saturating_add(1);
+                                    } else {
+                                        *last_net = net;
+                                        *cnt = 1;
+                                    }
+                                }
+                                None => {
+                                    st.insert(cid.clone(), (net, 1));
+                                }
+                            }
                         }
                     }
 

@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
         cfg.enable_follower_drift_check, // optional drift check
         cfg.enable_order_copy,  // optional order mirroring
         cfg.order_poll_ms,
+        cfg.order_catchup_ms,
     );
 
     // One-time reconcile via REST (align followers to leader)
