@@ -39,6 +39,9 @@ pub struct Copier {
     // Track recent leader fills per contract to prevent immediate opposite re-entry
     // value = (filled_side: 0=Buy,1=Sell, timestamp)
     pub src_recent_fills: Arc<RwLock<AHashMap<String, (i32, Instant)>>>, 
+
+    // Track open mirrored orders per destination+contract to pause market-based sync while pending
+    pub open_mirrored: Arc<RwLock<AHashMap<(i32, String), usize>>>,
 }
 
 impl Copier {
@@ -64,6 +67,7 @@ impl Copier {
             dest_pos: Arc::new(RwLock::new(AHashMap::new())),
             src_stable: Arc::new(RwLock::new(AHashMap::new())),
             src_recent_fills: Arc::new(RwLock::new(AHashMap::new())), 
+            open_mirrored: Arc::new(RwLock::new(AHashMap::new())),
         }
     }
 
@@ -168,6 +172,19 @@ impl Copier {
         for i in 0..n {
             let dest = self.dest_account_ids[i];
             let dest_net = self.get_dest_net_cached(dest, contract_id).await;
+
+            // If we're mirroring orders and have open mapped orders for this dest+contract, pause market sync.
+            if self.enable_order_copy {
+                let pause = {
+                    let om = self.open_mirrored.read().await;
+                    om.get(&(dest, contract_id.to_string())).copied().unwrap_or(0) > 0
+                };
+                if pause {
+                    info!("Sync pause: pending mirrored orders on {} for dest {}, skipping market sync", contract_id, dest);
+                    continue;
+                }
+            }
+
             let diff = src_net - dest_net;
             if diff == 0 { continue; }
 
@@ -371,6 +388,7 @@ impl Copier {
             let order_catchup_ms = self.order_catchup_ms;
             let src_stable = self.src_stable.clone();
             let src_recent_fills = self.src_recent_fills.clone();
+            let open_mirrored = self.open_mirrored.clone();
 
             #[derive(Clone, Debug, PartialEq)]
             struct OrderSnap {
@@ -413,17 +431,6 @@ impl Copier {
                             let mut new_linked: Vec<(i64, OrderSnap)> = Vec::new();
                             for (oid, snap) in current.iter() {
                                 if !last.contains_key(oid) {
-                                    // Classify entry vs protective using current leader net from cache
-                                    let leader_net = {
-                                        let sp = src_pos.read().await;
-                                        *sp.get(&(source_account_id, snap.contract_id.clone())).unwrap_or(&0)
-                                    };
-                                    let effect = if snap.side == 0 { snap.size } else { -snap.size };
-                                    let is_entry = if leader_net >= 0 { effect > 0 } else { effect < 0 };
-                                    if is_entry {
-                                        // Skip mirroring entry orders to avoid double-sizing with market sync
-                                        continue;
-                                    }
                                     if snap.linked_order_id.is_some() {
                                         new_linked.push((*oid, snap.clone()));
                                     } else {
@@ -456,6 +463,10 @@ impl Copier {
                                         Ok(r) => {
                                             info!("Order copy: placed dest {} for leader order {} => dest order {}", dest, oid, r.order_id);
                                             map_dest_order.insert((dest, oid), r.order_id);
+                                            {
+                                                let mut om = open_mirrored.write().await;
+                                                *om.entry((dest, snap.contract_id.clone())).or_insert(0) += 1;
+                                            }
                                         }
                                         Err(e) => warn!("Order copy: failed to place for leader order {} on dest {}: {}", oid, dest, e),
                                     }
@@ -488,6 +499,10 @@ impl Copier {
                                                     info!("Order copy: placed LINKED dest {} for leader order {} (parent {}) => dest order {} (parent {})",
                                                         dest, oid, parent_leader_id, r.order_id, parent_dest_id);
                                                     map_dest_order.insert((dest, oid), r.order_id);
+                                                    {
+                                                        let mut om = open_mirrored.write().await;
+                                                        *om.entry((dest, snap.contract_id.clone())).or_insert(0) += 1;
+                                                    }
                                                 }
                                                 Err(e) => warn!("Order copy: failed to place linked order {} on dest {}: {}", oid, dest, e),
                                             }
@@ -512,6 +527,10 @@ impl Copier {
                                                 Ok(r) => {
                                                     info!("Order copy: placed UNLINKED protective order on dest {} for leader {} => dest order {} (parent {} not mapped)", dest, oid, r.order_id, parent_leader_id);
                                                     map_dest_order.insert((dest, oid), r.order_id);
+                                                    {
+                                                        let mut om = open_mirrored.write().await;
+                                                        *om.entry((dest, snap.contract_id.clone())).or_insert(0) += 1;
+                                                    }
                                                 }
                                                 Err(e) => warn!("Order copy: failed to place unlinked protective order {} on dest {}: {}", oid, dest, e),
                                             }
@@ -570,10 +589,18 @@ impl Copier {
                                                 let order_id_clone = d_oid;
                                                 let src_stable_clone = src_stable.clone();
                                                 let src_recent_fills_clone = src_recent_fills.clone();
+                                                let open_mirrored_clone = open_mirrored.clone();
                                                 tokio::spawn(async move {
                                                     tokio::time::sleep(std::time::Duration::from_millis(order_catchup_ms)).await;
                                                     // attempt to cancel the lingering follower order
                                                     let _ = client_clone.cancel_order(dest_id_clone, order_id_clone).await;
+                                                    {
+                                                        let mut om = open_mirrored_clone.write().await;
+                                                        if let Some(cnt) = om.get_mut(&(dest_id_clone, contract.clone())) {
+                                                            if *cnt > 0 { *cnt -= 1; }
+                                                            if *cnt == 0 { om.remove(&(dest_id_clone, contract.clone())); }
+                                                        }
+                                                    }
                                                     // compute diff vs leader and market-sync if needed
                                                     let leader_net = {
                                                         let sp = src_pos_clone.read().await;
@@ -657,6 +684,13 @@ impl Copier {
                                             } else {
                                                 info!("Order copy: cancelled dest {} order {} (leader order {} gone)", dest, d_oid, oid);
                                                 map_dest_order.remove(&(dest, *oid));
+                                                {
+                                                    let mut om = open_mirrored.write().await;
+                                                    if let Some(cnt) = om.get_mut(&(dest, snap_prev.contract_id.clone())) {
+                                                        if *cnt > 0 { *cnt -= 1; }
+                                                        if *cnt == 0 { om.remove(&(dest, snap_prev.contract_id.clone())); }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -667,15 +701,6 @@ impl Copier {
                             for (oid, snap_now) in current.iter() {
                                 if let Some(prev) = last.get(oid) {
                                     if prev != snap_now {
-                                        // Skip entry orders (we rely on position sync for entries)
-                                        let leader_net = {
-                                            let sp = src_pos.read().await;
-                                            *sp.get(&(source_account_id, snap_now.contract_id.clone())).unwrap_or(&0)
-                                        };
-                                        let effect = if snap_now.side == 0 { snap_now.size } else { -snap_now.size };
-                                        let is_entry = if leader_net >= 0 { effect > 0 } else { effect < 0 };
-                                        if is_entry { continue; }
-
                                         let n = dest_clients.len().min(dest_ids.len());
                                         for i in 0..n {
                                             let dest = dest_ids[i];
@@ -721,6 +746,10 @@ impl Copier {
                                                 };
                                                 if let Ok(r) = client.place_order(&req).await {
                                                     map_dest_order.insert((dest, *oid), r.order_id);
+                                                    {
+                                                        let mut om = open_mirrored.write().await;
+                                                        *om.entry((dest, snap_now.contract_id.clone())).or_insert(0) += 1;
+                                                    }
                                                 }
                                             }
                                         }
