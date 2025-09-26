@@ -445,13 +445,20 @@ impl Copier {
                                     let dest = dest_ids[i];
                                     let client = &dest_clients[i];
                                     let tag = Some(format!("TCX:ORD:{}", oid));
+                                    // Normalize: if LIMIT without limit_price, fallback to JoinBid/JoinAsk
+                                    let mut otype = snap.r#type;
+                                    let mut lpx = snap.limit_price;
+                                    if otype == 1 && lpx.is_none() {
+                                        otype = if snap.side == 0 { 6 } else { 7 };
+                                        info!("Order copy: leader {} LIMIT without price on {}, falling back to {} for dest {}", oid, snap.contract_id, if snap.side==0 {"JoinBid"} else {"JoinAsk"}, dest);
+                                    }
                                     let req = PlaceOrderReq {
                                         account_id: dest,
                                         contract_id: &snap.contract_id,
-                                        r#type: snap.r#type,
+                                        r#type: otype,
                                         side: snap.side,
                                         size: snap.size,
-                                        limit_price: snap.limit_price,
+                                        limit_price: lpx,
                                         stop_price: snap.stop_price,
                                         trail_price: snap.trail_price,
                                         custom_tag: tag,
@@ -480,13 +487,20 @@ impl Copier {
                                     if let Some(parent_leader_id) = snap.linked_order_id {
                                         if let Some(&parent_dest_id) = map_dest_order.get(&(dest, parent_leader_id)) {
                                             let tag = Some(format!("TCX:ORD:{}", oid));
+                                            // Normalize: if LIMIT without limit_price, fallback to JoinBid/JoinAsk
+                                            let mut otype = snap.r#type;
+                                            let mut lpx = snap.limit_price;
+                                            if otype == 1 && lpx.is_none() {
+                                                otype = if snap.side == 0 { 6 } else { 7 };
+                                                info!("Order copy: leader {} LIMIT without price on {}, falling back to {} for dest {} (linked)", oid, snap.contract_id, if snap.side==0 {"JoinBid"} else {"JoinAsk"}, dest);
+                                            }
                                             let req = PlaceOrderReq {
                                                 account_id: dest,
                                                 contract_id: &snap.contract_id,
-                                                r#type: snap.r#type,
+                                                r#type: otype,
                                                 side: snap.side,
                                                 size: snap.size,
-                                                limit_price: snap.limit_price,
+                                                limit_price: lpx,
                                                 stop_price: snap.stop_price,
                                                 trail_price: snap.trail_price,
                                                 custom_tag: tag,
@@ -509,13 +523,20 @@ impl Copier {
                                         } else {
                                             // Parent not mapped yet on this dest; place without linkage to ensure protective leg exists
                                             let tag = Some(format!("TCX:ORD:{}", oid));
+                                            // Normalize: if LIMIT without limit_price, fallback to JoinBid/JoinAsk
+                                            let mut otype = snap.r#type;
+                                            let mut lpx = snap.limit_price;
+                                            if otype == 1 && lpx.is_none() {
+                                                otype = if snap.side == 0 { 6 } else { 7 };
+                                                info!("Order copy: leader {} LIMIT without price on {}, falling back to {} for dest {} (parent not mapped)", oid, snap.contract_id, if snap.side==0 {"JoinBid"} else {"JoinAsk"}, dest);
+                                            }
                                             let req = PlaceOrderReq {
                                                 account_id: dest,
                                                 contract_id: &snap.contract_id,
-                                                r#type: snap.r#type,
+                                                r#type: otype,
                                                 side: snap.side,
                                                 size: snap.size,
-                                                limit_price: snap.limit_price,
+                                                limit_price: lpx,
                                                 stop_price: snap.stop_price,
                                                 trail_price: snap.trail_price,
                                                 custom_tag: tag,
@@ -730,13 +751,20 @@ impl Copier {
                                                         linked = None;
                                                     }
                                                 }
+                                                // Normalize: if LIMIT without limit_price, fallback to JoinBid/JoinAsk
+                                                let mut otype = snap_now.r#type;
+                                                let mut lpx = snap_now.limit_price;
+                                                if otype == 1 && lpx.is_none() {
+                                                    otype = if snap_now.side == 0 { 6 } else { 7 };
+                                                    info!("Order copy: leader {} LIMIT without price on {}, falling back to {} for dest {} (modify/place)", oid, snap_now.contract_id, if snap_now.side==0 {"JoinBid"} else {"JoinAsk"}, dest);
+                                                }
                                                 let req = PlaceOrderReq {
                                                     account_id: dest,
                                                     contract_id: &snap_now.contract_id,
-                                                    r#type: snap_now.r#type,
+                                                    r#type: otype,
                                                     side: snap_now.side,
                                                     size: snap_now.size,
-                                                    limit_price: snap_now.limit_price,
+                                                    limit_price: lpx,
                                                     stop_price: snap_now.stop_price,
                                                     trail_price: snap_now.trail_price,
                                                     custom_tag: tag,
