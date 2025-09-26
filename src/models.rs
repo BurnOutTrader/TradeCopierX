@@ -92,6 +92,8 @@ pub struct OrderRecord {
     pub filled_price: Option<f64>,
     #[serde(default)]
     pub custom_tag: Option<String>,
+    #[serde(default)]
+    pub linked_order_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

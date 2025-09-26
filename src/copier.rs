@@ -317,6 +317,7 @@ impl Copier {
                 limit_price: Option<f64>,
                 stop_price: Option<f64>,
                 trail_price: Option<f64>,
+                linked_order_id: Option<i64>,
             }
             fn snap_from(o: &OrderRecord) -> OrderSnap {
                 OrderSnap {
@@ -327,6 +328,7 @@ impl Copier {
                     limit_price: o.limit_price,
                     stop_price: o.stop_price,
                     trail_price: o.trail_price,
+                    linked_order_id: o.linked_order_id,
                 }
             }
 
@@ -342,32 +344,77 @@ impl Copier {
                                 current.insert(o.id, snap_from(&o));
                             }
 
-                            // New orders
+                            // New orders (two-pass: unlinked first, then linked if parent mapped)
+                            let mut new_unlinked: Vec<(i64, OrderSnap)> = Vec::new();
+                            let mut new_linked: Vec<(i64, OrderSnap)> = Vec::new();
                             for (oid, snap) in current.iter() {
                                 if !last.contains_key(oid) {
-                                    let n = dest_clients.len().min(dest_ids.len());
-                                    for i in 0..n {
-                                        let dest = dest_ids[i];
-                                        let client = &dest_clients[i];
-                                        let tag = Some(format!("TCX:ORD:{}", oid));
-                                        let req = PlaceOrderReq {
-                                            account_id: dest,
-                                            contract_id: &snap.contract_id,
-                                            r#type: snap.r#type,
-                                            side: snap.side,
-                                            size: snap.size,
-                                            limit_price: snap.limit_price,
-                                            stop_price: snap.stop_price,
-                                            trail_price: snap.trail_price,
-                                            custom_tag: tag,
-                                            linked_order_id: None,
-                                        };
-                                        match client.place_order(&req).await {
-                                            Ok(r) => {
-                                                info!("Order copy: placed dest {} for leader order {} => dest order {}", dest, oid, r.order_id);
-                                                map_dest_order.insert((dest, *oid), r.order_id);
+                                    if snap.linked_order_id.is_some() {
+                                        new_linked.push((*oid, snap.clone()));
+                                    } else {
+                                        new_unlinked.push((*oid, snap.clone()));
+                                    }
+                                }
+                            }
+                            let n = dest_clients.len().min(dest_ids.len());
+                            // Pass 1: place unlinked orders
+                            for (oid, snap) in new_unlinked.into_iter() {
+                                for i in 0..n {
+                                    let dest = dest_ids[i];
+                                    let client = &dest_clients[i];
+                                    let tag = Some(format!("TCX:ORD:{}", oid));
+                                    let req = PlaceOrderReq {
+                                        account_id: dest,
+                                        contract_id: &snap.contract_id,
+                                        r#type: snap.r#type,
+                                        side: snap.side,
+                                        size: snap.size,
+                                        limit_price: snap.limit_price,
+                                        stop_price: snap.stop_price,
+                                        trail_price: snap.trail_price,
+                                        custom_tag: tag,
+                                        linked_order_id: None,
+                                    };
+                                    match client.place_order(&req).await {
+                                        Ok(r) => {
+                                            info!("Order copy: placed dest {} for leader order {} => dest order {}", dest, oid, r.order_id);
+                                            map_dest_order.insert((dest, oid), r.order_id);
+                                        }
+                                        Err(e) => warn!("Order copy: failed to place for leader order {} on dest {}: {}", oid, dest, e),
+                                    }
+                                }
+                            }
+                            // Pass 2: place linked orders only when parent mapping exists
+                            for (oid, snap) in new_linked.into_iter() {
+                                for i in 0..n {
+                                    let dest = dest_ids[i];
+                                    let client = &dest_clients[i];
+                                    if let Some(parent_leader_id) = snap.linked_order_id {
+                                        if let Some(&parent_dest_id) = map_dest_order.get(&(dest, parent_leader_id)) {
+                                            let tag = Some(format!("TCX:ORD:{}", oid));
+                                            let req = PlaceOrderReq {
+                                                account_id: dest,
+                                                contract_id: &snap.contract_id,
+                                                r#type: snap.r#type,
+                                                side: snap.side,
+                                                size: snap.size,
+                                                limit_price: snap.limit_price,
+                                                stop_price: snap.stop_price,
+                                                trail_price: snap.trail_price,
+                                                custom_tag: tag,
+                                                linked_order_id: Some(parent_dest_id),
+                                            };
+                                            match client.place_order(&req).await {
+                                                Ok(r) => {
+                                                    info!("Order copy: placed LINKED dest {} for leader order {} (parent {}) => dest order {} (parent {})",
+                                                        dest, oid, parent_leader_id, r.order_id, parent_dest_id);
+                                                    map_dest_order.insert((dest, oid), r.order_id);
+                                                }
+                                                Err(e) => warn!("Order copy: failed to place linked order {} on dest {}: {}", oid, dest, e),
                                             }
-                                            Err(e) => warn!("Order copy: failed to place for leader order {} on dest {}: {}", oid, dest, e),
+                                        } else {
+                                            // Parent not mapped yet on this dest; will retry next cycle
+                                            tracing::debug!("Order copy: defer linked order {} on dest {} (parent {} not mapped yet)", oid, dest, parent_leader_id);
                                         }
                                     }
                                 }
@@ -414,8 +461,18 @@ impl Copier {
                                                     Err(e) => warn!("Order copy: modify failed on dest {} order {}: {}", dest, d_oid, e),
                                                 }
                                             } else {
-                                                // No mapping (e.g., restart) — place new
+                                                // No mapping (e.g., restart) — try to place new with linkage if parent is mapped
                                                 let tag = Some(format!("TCX:ORD:{}", oid));
+                                                let mut linked: Option<i64> = None;
+                                                if let Some(parent_leader_id) = snap_now.linked_order_id {
+                                                    if let Some(&parent_dest_id) = map_dest_order.get(&(dest, parent_leader_id)) {
+                                                        linked = Some(parent_dest_id);
+                                                    } else {
+                                                        // Defer placing this linked order until parent is mapped on this dest
+                                                        tracing::debug!("Order copy: defer linked order {} on dest {} during remap (parent {} not mapped)", oid, dest, parent_leader_id);
+                                                        continue;
+                                                    }
+                                                }
                                                 let req = PlaceOrderReq {
                                                     account_id: dest,
                                                     contract_id: &snap_now.contract_id,
@@ -426,7 +483,7 @@ impl Copier {
                                                     stop_price: snap_now.stop_price,
                                                     trail_price: snap_now.trail_price,
                                                     custom_tag: tag,
-                                                    linked_order_id: None,
+                                                    linked_order_id: linked,
                                                 };
                                                 if let Ok(r) = client.place_order(&req).await {
                                                     map_dest_order.insert((dest, *oid), r.order_id);
