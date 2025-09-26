@@ -2,7 +2,7 @@
 TradeCopierX syncs positions from a leader account to one or more follower accounts.
 - Leader (source) = the account whose positions are mirrored.
 - Followers (destinations) = accounts that automatically copy trades from the leader.
-- The best way is to copy to one account and then use ProjectX internal copy trader for sub followers.
+- Each follower firm can only specify 1 leader account, use the projectX internal copy trader to mirror to multiple accounts.
 
 ## Features
 - REST-only design — avoids duplicate logins and CME rule violations by not using realtime hubs.
