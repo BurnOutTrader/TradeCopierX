@@ -10,7 +10,7 @@ TradeCopierX syncs positions from a leader account to one or more follower accou
 - Polling — leader positions are polled once every 1.5s (default), well within rate limits.
 - Safe follower state — follower positions are tracked locally from the orders we place.
 - Optional drift check — can poll follower positions to ensure they haven’t been manually altered.
-- Optional order mirroring — can poll leader open orders and mirror create/modify/cancel to followers (OFF by default).
+- Optional order mirroring — can poll leader open orders and mirror create/modify/cancel to followers (OFF by default). When enabled, entry orders are intentionally NOT mirrored to avoid double-sizing with market-based position sync; only protective/exit orders (e.g., stops/targets) are mirrored.
 - Bracket/OCO awareness — when the leader exposes linked_order_id, follower orders are placed with linkage to preserve OCO behavior. If linkage isn’t available from the API, we still mirror both legs individually and cancel the sibling leg as soon as the leader removes it (small risk window equal to poll interval).
 - Rate-limit aware — avoids hitting ProjectX’s API caps (200 requests/minute).
 - Optional Order copying for Limit and Stop orders (Totally untested)

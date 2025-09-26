@@ -307,6 +307,7 @@ impl Copier {
             let dest_clients = self.dests.clone();
             let dest_ids = self.dest_account_ids.clone();
             let poll_ms = self.order_poll_ms;
+            let src_pos = self.src_pos.clone();
 
             #[derive(Clone, Debug, PartialEq)]
             struct OrderSnap {
@@ -349,6 +350,17 @@ impl Copier {
                             let mut new_linked: Vec<(i64, OrderSnap)> = Vec::new();
                             for (oid, snap) in current.iter() {
                                 if !last.contains_key(oid) {
+                                    // Classify entry vs protective using current leader net from cache
+                                    let leader_net = {
+                                        let sp = src_pos.read().await;
+                                        *sp.get(&(source_account_id, snap.contract_id.clone())).unwrap_or(&0)
+                                    };
+                                    let effect = if snap.side == 0 { snap.size } else { -snap.size };
+                                    let is_entry = if leader_net >= 0 { effect > 0 } else { effect < 0 };
+                                    if is_entry {
+                                        // Skip mirroring entry orders to avoid double-sizing with market sync
+                                        continue;
+                                    }
                                     if snap.linked_order_id.is_some() {
                                         new_linked.push((*oid, snap.clone()));
                                     } else {
@@ -413,8 +425,27 @@ impl Copier {
                                                 Err(e) => warn!("Order copy: failed to place linked order {} on dest {}: {}", oid, dest, e),
                                             }
                                         } else {
-                                            // Parent not mapped yet on this dest; will retry next cycle
-                                            tracing::debug!("Order copy: defer linked order {} on dest {} (parent {} not mapped yet)", oid, dest, parent_leader_id);
+                                            // Parent not mapped yet on this dest; place without linkage to ensure protective leg exists
+                                            let tag = Some(format!("TCX:ORD:{}", oid));
+                                            let req = PlaceOrderReq {
+                                                account_id: dest,
+                                                contract_id: &snap.contract_id,
+                                                r#type: snap.r#type,
+                                                side: snap.side,
+                                                size: snap.size,
+                                                limit_price: snap.limit_price,
+                                                stop_price: snap.stop_price,
+                                                trail_price: snap.trail_price,
+                                                custom_tag: tag,
+                                                linked_order_id: None,
+                                            };
+                                            match client.place_order(&req).await {
+                                                Ok(r) => {
+                                                    info!("Order copy: placed UNLINKED protective order on dest {} for leader {} => dest order {} (parent {} not mapped)", dest, oid, r.order_id, parent_leader_id);
+                                                    map_dest_order.insert((dest, oid), r.order_id);
+                                                }
+                                                Err(e) => warn!("Order copy: failed to place unlinked protective order {} on dest {}: {}", oid, dest, e),
+                                            }
                                         }
                                     }
                                 }
@@ -443,6 +474,15 @@ impl Copier {
                             for (oid, snap_now) in current.iter() {
                                 if let Some(prev) = last.get(oid) {
                                     if prev != snap_now {
+                                        // Skip entry orders (we rely on position sync for entries)
+                                        let leader_net = {
+                                            let sp = src_pos.read().await;
+                                            *sp.get(&(source_account_id, snap_now.contract_id.clone())).unwrap_or(&0)
+                                        };
+                                        let effect = if snap_now.side == 0 { snap_now.size } else { -snap_now.size };
+                                        let is_entry = if leader_net >= 0 { effect > 0 } else { effect < 0 };
+                                        if is_entry { continue; }
+
                                         let n = dest_clients.len().min(dest_ids.len());
                                         for i in 0..n {
                                             let dest = dest_ids[i];
@@ -461,16 +501,15 @@ impl Copier {
                                                     Err(e) => warn!("Order copy: modify failed on dest {} order {}: {}", dest, d_oid, e),
                                                 }
                                             } else {
-                                                // No mapping (e.g., restart) — try to place new with linkage if parent is mapped
+                                                // No mapping (e.g., restart) — place new; use linkage if parent is mapped, else place unlinked
                                                 let tag = Some(format!("TCX:ORD:{}", oid));
                                                 let mut linked: Option<i64> = None;
                                                 if let Some(parent_leader_id) = snap_now.linked_order_id {
                                                     if let Some(&parent_dest_id) = map_dest_order.get(&(dest, parent_leader_id)) {
                                                         linked = Some(parent_dest_id);
                                                     } else {
-                                                        // Defer placing this linked order until parent is mapped on this dest
-                                                        tracing::debug!("Order copy: defer linked order {} on dest {} during remap (parent {} not mapped)", oid, dest, parent_leader_id);
-                                                        continue;
+                                                        // parent not mapped; we'll place unlinked
+                                                        linked = None;
                                                     }
                                                 }
                                                 let req = PlaceOrderReq {
