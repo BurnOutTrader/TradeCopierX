@@ -13,6 +13,7 @@ TradeCopierX syncs positions from a leader account to one or more follower accou
 - Optional order mirroring — can poll leader open orders and mirror create/modify/cancel to followers (OFF by default). When enabled, entry orders are intentionally NOT mirrored to avoid double-sizing with market-based position sync; only protective/exit orders (e.g., stops/targets) are mirrored.
 - Bracket/OCO awareness — when the leader exposes linked_order_id, follower orders are placed with linkage to preserve OCO behavior. If linkage isn’t available from the API, we still mirror both legs individually and cancel the sibling leg as soon as the leader removes it (small risk window equal to poll interval). The API also supports placing brackets via takeProfitBracket/stopLossBracket on Order/place; our client now supports these fields, but since we do not mirror entry orders, we currently mirror protective legs as standalone orders (with OCO linkage when possible) rather than attaching bracket objects to entries.
 - Fill catch-up — tracks recent leader fills via /api/Order/search; if a mirrored protective order fills on the leader but not on a follower, after ORDER_CATCHUP_MS we cancel the follower’s pending order and market-sync the position to the leader to prevent desyncs.
+- Recent-fill lockout — immediately after a leader protective fill, the copier blocks any action that would increase a follower’s exposure in the opposite direction for a short window (uses ORDER_CATCHUP_MS). This prevents accidental re-entry caused by leader position snapshots lagging momentarily.
 - Rate-limit aware — avoids hitting ProjectX’s API caps (200 requests/minute).
 - Optional Order copying for Limit and Stop orders (Totally untested)
 
@@ -66,6 +67,7 @@ FOLLOWER_DRIFT_CHECK=0
 ORDER_COPY=0
 # Optionally override order polling cadence (defaults to SOURCE_POLL_MS)
 ORDER_POLL_MS=1500
+# After a leader protective order fills but follower hasn't, wait this long before cancel+market catch-up
 ORDER_CATCHUP_MS=2000
 # ========= Optional tuning =========
 PX_MAX_RESYNC=2147483647

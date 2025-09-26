@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use std::time::{Instant, Duration};
 
 static ORDER_TAG_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -34,6 +35,10 @@ pub struct Copier {
 
     // Track leader stability per contract: (last_net, consecutive_count)
     pub src_stable: Arc<RwLock<AHashMap<String, (i32, u32)>>>,
+
+    // Track recent leader fills per contract to prevent immediate opposite re-entry
+    // value = (filled_side: 0=Buy,1=Sell, timestamp)
+    pub src_recent_fills: Arc<RwLock<AHashMap<String, (i32, Instant)>>>, 
 }
 
 impl Copier {
@@ -58,6 +63,7 @@ impl Copier {
             src_pos: Arc::new(RwLock::new(AHashMap::new())),
             dest_pos: Arc::new(RwLock::new(AHashMap::new())),
             src_stable: Arc::new(RwLock::new(AHashMap::new())),
+            src_recent_fills: Arc::new(RwLock::new(AHashMap::new())), 
         }
     }
 
@@ -167,6 +173,28 @@ impl Copier {
 
             let step = diff.clamp(-self.max_resync_step, self.max_resync_step);
             if step == 0 { continue; }
+
+            // Recent-fill lockout: if this action would increase absolute exposure in the
+            // opposite direction right after a leader protective fill, skip for a short window.
+            if self.enable_order_copy {
+                let pre_abs = dest_net.abs();
+                let post_abs = (dest_net + step).abs();
+                if post_abs > pre_abs {
+                    let step_side = if step > 0 { 0 } else { 1 }; // 0=buy,1=sell
+                    let block = {
+                        let rf = self.src_recent_fills.read().await;
+                        if let Some((filled_side, ts)) = rf.get(contract_id) {
+                            let within = Instant::now().saturating_duration_since(*ts) < Duration::from_millis(self.order_catchup_ms);
+                            // block opening in the opposite direction immediately after protective fill
+                            within && ((step_side == 0 && *filled_side == 1) || (step_side == 1 && *filled_side == 0))
+                        } else { false }
+                    };
+                    if block {
+                        info!("Recent-fill lockout: deferring {} step {} on dest {} (dest_net {}, src_net {})", contract_id, step, dest, dest_net, src_net);
+                        continue;
+                    }
+                }
+            }
 
             // Anti-churn stability gate: when ORDER_COPY is enabled, avoid increasing follower exposure
             // unless the leader net has been stable for at least 2 consecutive polls.
@@ -342,6 +370,7 @@ impl Copier {
             let dest_pos = self.dest_pos.clone();
             let order_catchup_ms = self.order_catchup_ms;
             let src_stable = self.src_stable.clone();
+            let src_recent_fills = self.src_recent_fills.clone();
 
             #[derive(Clone, Debug, PartialEq)]
             struct OrderSnap {
@@ -527,6 +556,11 @@ impl Copier {
 
                                             // If the leader removal corresponds to a fill, schedule catch-up: cancel + market-sync after delay
                                             if filled_leader_oids.contains(oid) {
+                                                // Record recent leader fill to avoid opposite-direction re-entry
+                                                {
+                                                    let mut rf = src_recent_fills.write().await;
+                                                    rf.insert(snap_prev.contract_id.clone(), (snap_prev.side, Instant::now()));
+                                                }
                                                 let contract = snap_prev.contract_id.clone();
                                                 let src_pos_clone = src_pos.clone();
                                                 let dest_pos_clone = dest_pos.clone();
@@ -535,6 +569,7 @@ impl Copier {
                                                 let source_account_id_clone = source_account_id;
                                                 let order_id_clone = d_oid;
                                                 let src_stable_clone = src_stable.clone();
+                                                let src_recent_fills_clone = src_recent_fills.clone();
                                                 tokio::spawn(async move {
                                                     tokio::time::sleep(std::time::Duration::from_millis(order_catchup_ms)).await;
                                                     // attempt to cancel the lingering follower order
@@ -550,6 +585,23 @@ impl Copier {
                                                     };
                                                     let diff = leader_net - dest_net;
                                                     if diff != 0 {
+                                                        // Apply recent-fill lockout first to avoid opposite-direction re-entry immediately after fill
+                                                        let pre_abs = dest_net.abs();
+                                                        let post_abs = (dest_net + diff).abs();
+                                                        if post_abs > pre_abs {
+                                                            let step_side = if diff > 0 { 0 } else { 1 };
+                                                            let block = {
+                                                                let rf = src_recent_fills_clone.read().await;
+                                                                if let Some((filled_side, ts)) = rf.get(&contract) {
+                                                                    let within = Instant::now().saturating_duration_since(*ts) < std::time::Duration::from_millis(order_catchup_ms);
+                                                                    within && ((step_side == 0 && *filled_side == 1) || (step_side == 1 && *filled_side == 0))
+                                                                } else { false }
+                                                            };
+                                                            if block {
+                                                                info!("Catch-up lockout: skipping increase on {} for dest {} (leader_net {}, dest_net {}, diff {})", contract, dest_id_clone, leader_net, dest_net, diff);
+                                                                return;
+                                                            }
+                                                        }
                                                         // Apply stability gate to avoid accidental re-entry while leader cache hasn't refreshed
                                                         let pre_abs = dest_net.abs();
                                                         let post_abs = (dest_net + diff).abs();
